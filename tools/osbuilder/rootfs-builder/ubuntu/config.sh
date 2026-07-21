@@ -11,7 +11,7 @@ OS_NAME=ubuntu
 # This should be Ubuntu's code name, e.g. "focal" (Focal Fossa) for 20.04
 OS_VERSION=${OS_VERSION:-""}
 [[ -z "${OS_VERSION}" ]] && echo "OS_VERSION is required, but was not set" && exit 1
-PACKAGES="chrony iptables dbus"
+PACKAGES="chrony iptables dbus criu"
 # shellcheck disable=SC2154
 [[ "${AGENT_INIT}" = no ]] && PACKAGES+=" init"
 # cryptsetup-bin and e2fsprogs are installed unconditionally:
