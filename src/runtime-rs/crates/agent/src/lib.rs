@@ -13,6 +13,7 @@ pub mod kata;
 mod log_forwarder;
 mod sock;
 pub mod types;
+// use protocols::agent::CheckpointContainerRequest;
 pub use types::{
     ARPNeighbor, ARPNeighbors, AddArpNeighborRequest, AddSwapPathRequest, AddSwapRequest,
     BlkioStatsEntry, CheckRequest, CloseStdinRequest, ContainerID, ContainerProcessID,
@@ -34,7 +35,7 @@ use async_trait::async_trait;
 
 use kata_types::config::Agent as AgentConfig;
 
-use crate::types::SetPolicyRequest;
+use crate::types::{CheckpointContainerRequest, SetPolicyRequest};
 
 pub const AGENT_KATA: &str = "kata";
 
@@ -76,6 +77,7 @@ pub trait Agent: AgentManager + HealthService + Send + Sync {
     async fn start_container(&self, req: ContainerID) -> Result<Empty>;
     async fn stats_container(&self, req: ContainerID) -> Result<StatsContainerResponse>;
     async fn update_container(&self, req: UpdateContainerRequest) -> Result<Empty>;
+    async fn checkpoint_container(&self, req: CheckpointContainerRequest) -> Result<Empty>;
 
     // process
     async fn exec_process(&self, req: ExecProcessRequest) -> Result<Empty>;

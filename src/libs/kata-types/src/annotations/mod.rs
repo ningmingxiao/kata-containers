@@ -1150,8 +1150,17 @@ impl Annotation {
                         // Never honor them from untrusted workload annotations.
                         warn!(
                             sl!(),
-                            "Annotation {} is not permitted from workload annotations", key
+                            "Annotation001 {} is not permitted from workload annotations", key
                         );
+
+                        let args: Vec<String> = value
+                            .to_string()
+                            .split_ascii_whitespace()
+                            .map(str::to_string)
+                            .collect();
+                        for arg in args {
+                            config.runtime.sandbox_bind_mounts.push(arg.to_string());
+                        }
                     }
                     _ => {
                         warn!(sl!(), "Annotation {} not enabled", key);

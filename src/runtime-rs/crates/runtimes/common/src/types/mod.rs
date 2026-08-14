@@ -17,6 +17,7 @@ use std::{
 
 use crate::SandboxNetworkEnv;
 
+// use agent::types::CheckpointContainerRequest;
 use anyhow::{Context, Result};
 use kata_sys_util::validate;
 use kata_types::mount::Mount;
@@ -42,6 +43,7 @@ pub enum TaskRequest {
     ShutdownContainer(ShutdownRequest),
     PauseContainer(ContainerID),
     ResumeContainer(ContainerID),
+    CheckpointContainer(CheckpointContainerRequest),
     ResizeProcessPTY(ResizePTYRequest),
     StatsContainer(ContainerID),
     UpdateContainer(UpdateRequest),
@@ -69,6 +71,7 @@ pub enum TaskResponse {
     UpdateContainer,
     Pid(PID),
     ConnectContainer(PID),
+    CheckpointContainer,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -258,6 +261,20 @@ pub struct KillRequest {
 pub struct ShutdownRequest {
     pub container_id: String,
     pub is_now: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct CheckpointContainerRequest {
+    pub container_id: String,
+    pub work_dir: String,
+    pub path: String,
+    pub exit: bool,
+    pub allow_open_tcp: bool,
+    pub allow_external_unix_sockets: bool,
+    pub allow_terminal: bool,
+    pub file_locks: bool,
+    pub empty_namespaces: Vec<String>,
+    pub parent_path: String,
 }
 
 #[derive(Debug, Clone)]

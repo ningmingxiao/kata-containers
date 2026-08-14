@@ -4,6 +4,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
+use crate::types::CheckpointContainerRequest;
+
 use super::{
     ContainerConfig, ContainerID, ContainerProcess, ExecProcessRequest, KillRequest,
     ResizePTYRequest, SandboxConfig, SandboxID, SandboxNetworkEnv, SandboxRequest,
@@ -20,10 +22,9 @@ use std::{
 use protobuf::Message;
 use runtime_spec;
 
-use protocols::api as cri_api_v1;
-
 use anyhow::{anyhow, Context, Result};
-use containerd_shim_protos::{api, sandbox_api};
+use containerd_shim_protos::{api, sandbox_api, shim::oci::CheckpointOptions};
+use protocols::api as cri_api_v1;
 
 pub const SANDBOX_API_V1: &str = "runtime.v1.PodSandboxConfig";
 
@@ -173,6 +174,31 @@ impl TryFrom<api::CreateTaskRequest> for TaskRequest {
             stdout: (!from.stdout.is_empty()).then(|| from.stdout.clone()),
             stderr: (!from.stderr.is_empty()).then(|| from.stderr.clone()),
         }))
+    }
+}
+
+impl TryFrom<api::CheckpointTaskRequest> for TaskRequest {
+    type Error = anyhow::Error;
+    fn try_from(from: api::CheckpointTaskRequest) -> Result<Self> {
+        let mut opts: Vec<u8> = Vec::new();
+        if from.has_options() {
+            opts = from.options().value.to_vec();
+        }
+        let oci_opt = CheckpointOptions::parse_from_bytes(&opts)?;
+        Ok(TaskRequest::CheckpointContainer(
+            CheckpointContainerRequest {
+                container_id: from.id.clone(),
+                work_dir: oci_opt.work_path().to_string(),
+                path: from.path.clone(),
+                exit: oci_opt.exit(),
+                allow_open_tcp: oci_opt.open_tcp(),
+                allow_external_unix_sockets: oci_opt.external_unix_sockets(),
+                allow_terminal: oci_opt.terminal(),
+                file_locks: oci_opt.file_locks(),
+                empty_namespaces: oci_opt.empty_namespaces().to_vec(),
+                parent_path: String::new(),
+            },
+        ))
     }
 }
 

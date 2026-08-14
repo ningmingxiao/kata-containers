@@ -38,6 +38,7 @@ service AgentService {
 	rpc StatsContainer(StatsContainerRequest) returns (StatsContainerResponse);
 	rpc PauseContainer(PauseContainerRequest) returns (google.protobuf.Empty);
 	rpc ResumeContainer(ResumeContainerRequest) returns (google.protobuf.Empty);
+	rpc CheckpointContainer(CheckpointContainerRequest) returns (google.protobuf.Empty);
 	rpc RemoveStaleVirtiofsShareMounts(RemoveStaleVirtiofsShareMountsRequest) returns (google.protobuf.Empty);
 	rpc GetDiagnosticData(GetDiagnosticDataRequest) returns (GetDiagnosticDataResponse);
 
@@ -180,6 +181,20 @@ message CpuUsage {
 	repeated uint64 percpu_usage = 2;
 	uint64 usage_in_kernelmode = 3;
 	uint64 usage_in_usermode = 4;
+}
+
+
+message CheckpointContainerRequest {
+	string container_id = 1;
+	string work_dir = 2;
+    string path = 3;
+    bool exit = 4;
+    bool allow_open_tcp = 5;
+    bool allow_external_unix_sockets = 6;
+    bool allow_terminal = 7;
+    bool file_locks = 8;
+    repeated string empty_namespaces = 9;
+    string parent_path = 10;
 }
 
 message ThrottlingData {

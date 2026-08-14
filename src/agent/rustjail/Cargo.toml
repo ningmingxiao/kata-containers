@@ -28,6 +28,9 @@ anyhow = "1.0.32"
 cgroups.workspace = true
 rlimit = "0.5.3"
 cfg-if.workspace = true
+rust-criu = "0.6.1"
+log = "0.4.33"
+simplelog = "0.12.2"
 
 tokio = { workspace = true, features = [
     "sync",

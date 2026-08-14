@@ -24,6 +24,7 @@ default MemAgentMemcgConfig := true
 default MemHotplugByProbeRequest := true
 default OnlineCPUMemRequest := true
 default PauseContainerRequest := true
+default CheckpointContainerRequest := true
 default PullImageRequest := true
 default ReadStreamRequest := true
 default RemoveContainerRequest := true

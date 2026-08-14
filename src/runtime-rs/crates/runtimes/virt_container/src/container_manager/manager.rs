@@ -13,9 +13,9 @@ use agent::Agent;
 use common::{
     error::Error,
     types::{
-        ContainerConfig, ContainerID, ContainerProcess, ExecProcessRequest, KillRequest,
-        ProcessExitStatus, ProcessStateInfo, ProcessStatus, ProcessType, ResizePTYRequest,
-        ShutdownRequest, StatsInfo, UpdateRequest, PID,
+        CheckpointContainerRequest, ContainerConfig, ContainerID, ContainerProcess,
+        ExecProcessRequest, KillRequest, ProcessExitStatus, ProcessStateInfo, ProcessStatus,
+        ProcessType, ResizePTYRequest, ShutdownRequest, StatsInfo, UpdateRequest, PID,
     },
     ContainerManager,
 };
@@ -407,6 +407,30 @@ impl ContainerManager for VirtContainerManager {
             .get(&id.container_id)
             .ok_or_else(|| Error::ContainerNotFound(id.container_id.clone()))?;
         c.resume().await.context("resume")?;
+        Ok(())
+    }
+
+    #[instrument]
+    async fn checkpoint_container(&self, req: &CheckpointContainerRequest) -> Result<()> {
+        let containers = self.containers.read().await;
+        let cid = req.container_id.clone();
+        let c = containers
+            .get(&cid)
+            .ok_or_else(|| Error::ContainerNotFound(cid))?;
+        c.checkpoint(
+            req.container_id.clone(),
+            req.work_dir.clone(),
+            req.path.clone(),
+            req.exit,
+            req.allow_open_tcp,
+            req.allow_external_unix_sockets,
+            req.allow_terminal,
+            req.file_locks,
+            req.empty_namespaces.clone(),
+            req.parent_path.clone(),
+        )
+        .await
+        .context("checkpoint")?;
         Ok(())
     }
 

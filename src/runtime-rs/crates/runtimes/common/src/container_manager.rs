@@ -5,8 +5,8 @@
 //
 
 use crate::types::{
-    ContainerConfig, ContainerID, ContainerProcess, ExecProcessRequest, KillRequest,
-    ProcessExitStatus, ProcessStateInfo, ResizePTYRequest, ShutdownRequest, StatsInfo,
+    CheckpointContainerRequest, ContainerConfig, ContainerID, ContainerProcess, ExecProcessRequest,
+    KillRequest, ProcessExitStatus, ProcessStateInfo, ResizePTYRequest, ShutdownRequest, StatsInfo,
     UpdateRequest, PID,
 };
 use anyhow::Result;
@@ -22,6 +22,7 @@ pub trait ContainerManager: Send + Sync {
     async fn stats_container(&self, container_id: &ContainerID) -> Result<StatsInfo>;
     async fn update_container(&self, req: UpdateRequest) -> Result<()>;
     async fn connect_container(&self, container_id: &ContainerID) -> Result<PID>;
+    async fn checkpoint_container(&self, req: &CheckpointContainerRequest) -> Result<()>;
 
     // process lifecycle
     async fn close_process_io(&self, process_id: &ContainerProcess) -> Result<()>;

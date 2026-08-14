@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use agent::Agent;
+use agent::{types::CheckpointContainerRequest, Agent};
 use anyhow::{anyhow, Context, Result};
 use common::{
     error::{is_no_such_process_error, Error},
@@ -26,6 +26,7 @@ use kata_types::{
 use oci_spec::runtime as oci;
 
 use oci::{LinuxResources, Process as OCIProcess};
+
 use resource::{
     cdi_devices::container_device::annotate_container_devices, ResourceManager, ResourceUpdateOp,
 };
@@ -647,6 +648,51 @@ impl Container {
             .await
             .context("agent pause container")?;
         inner.set_state(ProcessStatus::Paused).await;
+
+        Ok(())
+    }
+
+    pub async fn checkpoint(
+        &self,
+        container_id: String,
+        work_dir: String,
+        path: String,
+        exit: bool,
+        allow_open_tcp: bool,
+        allow_external_unix_sockets: bool,
+        allow_terminal: bool,
+        file_locks: bool,
+        empty_namespaces: Vec<String>,
+        parent_path: String,
+    ) -> Result<()> {
+        let r = CheckpointContainerRequest {
+            container_id: container_id,
+            work_dir: work_dir,
+            path: path,
+            exit: exit,
+            allow_open_tcp: allow_open_tcp,
+            allow_external_unix_sockets: allow_external_unix_sockets,
+            allow_terminal: allow_terminal,
+            file_locks: file_locks,
+            empty_namespaces: empty_namespaces,
+            parent_path: parent_path,
+        };
+
+        // let mut inner = self.inner.write().await;
+        // let status = inner.init_process.get_status().await;
+        // if status != ProcessStatus::Running {
+        //     warn!(
+        //         self.logger,
+        //         "container is in {:?} state, will not pause", status
+        //     );
+        //     return Ok(());
+        // }
+
+        self.agent
+            .checkpoint_container(r)
+            .await
+            .context("agent checkpoint container")?;
+        // inner.set_state(ProcessStatus::Paused).await;
 
         Ok(())
     }

@@ -765,6 +765,14 @@ impl RuntimeHandlerManager {
                     .context("resume container")?;
                 Ok(TaskResponse::ResumeContainer)
             }
+
+            TaskRequest::CheckpointContainer(req) => {
+                cm.checkpoint_container(&req)
+                    .await
+                    .context("resume container")?;
+                Ok(TaskResponse::CheckpointContainer)
+            }
+
             TaskRequest::ResizeProcessPTY(req) => {
                 cm.resize_process_pty(&req).await.context("resize pty")?;
                 Ok(TaskResponse::ResizeProcessPTY)

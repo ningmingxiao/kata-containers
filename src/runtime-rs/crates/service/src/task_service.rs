@@ -71,6 +71,7 @@ impl_service!(
     pids | api::PidsRequest | api::PidsResponse,
     pause | api::PauseRequest | api::Empty,
     resume | api::ResumeRequest | api::Empty,
+    checkpoint | api::CheckpointTaskRequest | api::Empty,
     kill | api::KillRequest | api::Empty,
     exec | api::ExecProcessRequest | api::Empty,
     resize_pty | api::ResizePtyRequest | api::Empty,

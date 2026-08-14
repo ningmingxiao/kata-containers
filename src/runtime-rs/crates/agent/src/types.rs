@@ -139,6 +139,20 @@ pub struct CreateContainerRequest {
 }
 
 #[derive(PartialEq, Clone, Default)]
+pub struct CheckpointContainerRequest {
+    pub container_id: String,
+    pub work_dir: String,
+    pub path: String,
+    pub exit: bool,
+    pub allow_open_tcp: bool,
+    pub allow_external_unix_sockets: bool,
+    pub allow_terminal: bool,
+    pub file_locks: bool,
+    pub empty_namespaces: Vec<String>,
+    pub parent_path: String,
+}
+
+#[derive(PartialEq, Clone, Default)]
 pub struct ContainerID {
     pub container_id: String,
 }

@@ -1047,6 +1047,33 @@ impl agent_ttrpc::AgentService for AgentService {
         Ok(Empty::new())
     }
 
+    async fn checkpoint_container(
+        &self,
+        ctx: &TtrpcContext,
+        req: protocols::agent::CheckpointContainerRequest,
+    ) -> ttrpc::Result<protocols::empty::Empty> {
+        trace_rpc_call!(ctx, "checkpoint_container001 ", req);
+        is_allowed(&req).await?;
+
+        let mut sandbox = self.sandbox.lock().await;
+        let ctr = sandbox
+            .get_container(&req.container_id)
+            .map_ttrpc_err(ttrpc::Code::INVALID_ARGUMENT, "invalid container id")?;
+        ctr.checkpoint(
+            &req.work_dir(),
+            &req.path(),
+            req.exit(),
+            req.allow_open_tcp(),
+            req.allow_external_unix_sockets(),
+            req.allow_terminal(),
+            req.file_locks(),
+            req.empty_namespaces(),
+            req.parent_path(),
+        )
+        .map_ttrpc_err(same)?;
+        Ok(Empty::new())
+    }
+
     async fn remove_stale_virtiofs_share_mounts(
         &self,
         ctx: &TtrpcContext,

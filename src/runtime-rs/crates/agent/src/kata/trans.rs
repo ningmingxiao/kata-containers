@@ -14,19 +14,19 @@ use protocols::{
 use crate::{
     types::{
         ARPNeighbor, ARPNeighbors, AddArpNeighborRequest, AddSwapPathRequest, AddSwapRequest,
-        AgentDetails, BlkioStats, BlkioStatsEntry, CgroupStats, CheckRequest, CloseStdinRequest,
-        ContainerID, CopyFileRequest, CpuStats, CpuUsage, CreateContainerRequest,
-        CreateSandboxRequest, Device, Empty, ExecProcessRequest, FSGroup, FSGroupChangePolicy,
-        GetIPTablesRequest, GetIPTablesResponse, GuestDetailsResponse, HealthCheckResponse,
-        HugetlbStats, IPAddress, IPFamily, Interface, Interfaces, KernelModule,
-        MemHotplugByProbeRequest, MemoryData, MemoryStats, MetricsResponse, NetworkStats,
-        OnlineCPUMemRequest, PidsStats, ReadStreamRequest, ReadStreamResponse,
-        RemoveContainerRequest, ReseedRandomDevRequest, ResizeVolumeRequest, Route, Routes,
-        SetGuestDateTimeRequest, SetIPTablesRequest, SetIPTablesResponse, SharedMount,
-        SignalProcessRequest, StatsContainerResponse, Storage, StringUser, ThrottlingData,
-        TtyWinResizeRequest, UpdateContainerRequest, UpdateInterfaceRequest, UpdateRoutesRequest,
-        VersionCheckResponse, VolumeStatsRequest, VolumeStatsResponse, WaitProcessRequest,
-        WriteStreamRequest,
+        AgentDetails, BlkioStats, BlkioStatsEntry, CgroupStats, CheckRequest,
+        CheckpointContainerRequest, CloseStdinRequest, ContainerID, CopyFileRequest, CpuStats,
+        CpuUsage, CreateContainerRequest, CreateSandboxRequest, Device, Empty, ExecProcessRequest,
+        FSGroup, FSGroupChangePolicy, GetIPTablesRequest, GetIPTablesResponse,
+        GuestDetailsResponse, HealthCheckResponse, HugetlbStats, IPAddress, IPFamily, Interface,
+        Interfaces, KernelModule, MemHotplugByProbeRequest, MemoryData, MemoryStats,
+        MetricsResponse, NetworkStats, OnlineCPUMemRequest, PidsStats, ReadStreamRequest,
+        ReadStreamResponse, RemoveContainerRequest, ReseedRandomDevRequest, ResizeVolumeRequest,
+        Route, Routes, SetGuestDateTimeRequest, SetIPTablesRequest, SetIPTablesResponse,
+        SharedMount, SignalProcessRequest, StatsContainerResponse, Storage, StringUser,
+        ThrottlingData, TtyWinResizeRequest, UpdateContainerRequest, UpdateInterfaceRequest,
+        UpdateRoutesRequest, VersionCheckResponse, VolumeStatsRequest, VolumeStatsResponse,
+        WaitProcessRequest, WriteStreamRequest,
     },
     GetDiagnosticDataRequest, GetDiagnosticDataResponse, GetGuestDetailsRequest, OomEventResponse,
     SetPolicyRequest, WaitProcessResponse, WriteStreamResponse,
@@ -284,6 +284,23 @@ impl From<CreateContainerRequest> for agent::CreateContainerRequest {
             stdin_port: from.stdin_port.unwrap_or_default(),
             stdout_port: from.stdout_port.unwrap_or_default(),
             stderr_port: from.stderr_port.unwrap_or_default(),
+            ..Default::default()
+        }
+    }
+}
+
+impl From<CheckpointContainerRequest> for agent::CheckpointContainerRequest {
+    fn from(from: CheckpointContainerRequest) -> Self {
+        Self {
+            container_id: from.container_id,
+            work_dir: from.work_dir,
+            path: from.path,
+            exit: from.exit,
+            allow_open_tcp: from.allow_open_tcp,
+            allow_terminal: from.allow_terminal,
+            file_locks: from.file_locks,
+            empty_namespaces: from.empty_namespaces,
+            parent_path: from.parent_path,
             ..Default::default()
         }
     }
