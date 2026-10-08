@@ -197,6 +197,30 @@ message CheckpointContainerRequest {
     string parent_path = 10;
 }
 
+
+
+
+enum CgMode {
+    CG_MODE_UNSPECIFIED = 0;
+    CG_MODE_NONE = 1;
+    CG_MODE_SOFT = 2;
+    CG_MODE_HARD = 3;
+}
+
+message RestoreContainerRequest {
+	string container_id = 1;
+	string console_socket = 2;
+    bool ext_unix_sk = 3;
+    bool file_locks = 4;
+    string image_path = 5;
+    CgMode manage_cgroups_mode = 6;
+    bool shell_job = 7;
+    bool tcp_established = 8;
+    string work_path = 9;
+}
+
+
+
 message ThrottlingData {
 	uint64 periods = 1;
 	uint64 throttled_periods = 2;

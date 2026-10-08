@@ -390,6 +390,183 @@ impl AgentService {
         Ok(())
     }
 
+
+
+
+       #[instrument]
+    async fn do_restore_container(
+        &self,
+        req: protocols::agent::RestoreContainerRequest,
+    ) -> Result<()> {
+        // create the proc_io first, in case there's some error occur below, thus we can make sure
+        // the io stream closed when error occur.
+        let proc_io = if AGENT_CONFIG.passfd_listener_port != 0 {
+            Some(passfd_io::take_io_streams(req.stdin_port, req.stdout_port, req.stderr_port).await)
+        } else {
+            None
+        };
+
+        let cid = req.container_id.clone();
+
+        kata_sys_util::validate::verify_id(&cid)?;
+
+        let use_sandbox_pidns = req.sandbox_pidns();
+
+        let mut oci = match req.OCI.into_option() {
+            Some(spec) => spec.into(),
+            None => {
+                error!(sl(), "no oci spec in the create container request!");
+                return Err(anyhow!(nix::Error::EINVAL));
+            }
+        };
+
+        let container_name = k8s::container_name(&oci);
+
+        info!(sl(), "receive createcontainer, spec: {:?}", &oci);
+        info!(
+            sl(),
+            "receive createcontainer, storages: {:?}", &req.storages
+        );
+
+        // Some devices need some extra processing (the ones invoked with
+        // --device for instance), and that's what this call is doing. It
+        // updates the devices listed in the OCI spec, so that they actually
+        // match real devices inside the VM. This step is necessary since we
+        // cannot predict everything from the caller.
+        add_devices(&cid, &sl(), &req.devices, &mut oci, &self.sandbox).await?;
+
+        // In guest-kernel mode some devices need extra handling. Taking the
+        // GPU as an example the shim will inject CDI annotations that will
+        // be used by the kata-agent to do containerEdits according to the
+        // CDI spec coming from a registry that is created on the fly by UDEV
+        // or other entities for a specifc device.
+        // In Kata we only consider the directory "/var/run/cdi", "/etc" may be
+        // readonly
+        dump_nvidia_cdi_yaml(&sl())?;
+        // When enabled, translate the container's VISIBLE_CDI_DEVICES
+        // environment variable into CDI GPU device requests, so that a
+        // container can select which of the VM's GPUs it sees at runtime.
+        let visible_cdi_devices = if AGENT_CONFIG.visible_cdi_devices {
+            cdi_devices_from_visible_devices(&oci)?
+        } else {
+            Vec::new()
+        };
+        handle_cdi_devices(
+            &sl(),
+            &mut oci,
+            "/var/run/cdi",
+            AGENT_CONFIG.cdi_timeout,
+            &visible_cdi_devices,
+        )
+        .await?;
+
+        // Handle trusted storage configuration before mounting any storage
+        cdh_handler_trusted_storage(&mut oci)
+            .await
+            .map_err(|e| anyhow!("failed to handle trusted storage: {}", e))?;
+
+        // Both rootfs and volumes (invoked with --volume for instance) will
+        // be processed the same way. The idea is to always mount any provided
+        // storage to the specified MountPoint, so that it will match what's
+        // inside oci.Mounts.
+        // After all those storages have been processed, no matter the order
+        // here, the agent will rely on rustjail (using the oci.Mounts
+        // list) to bind mount all of them inside the container.
+        let m = add_storages(
+            sl(),
+            req.storages.clone(),
+            &self.sandbox,
+            Some(req.container_id),
+        )
+        .await?;
+
+        // Handle sealed secrets after storage is mounted
+        cdh_handler_sealed_secrets(&mut oci)
+            .await
+            .map_err(|e| anyhow!("failed to handle sealed secrets: {}", e))?;
+
+        let mut s = self.sandbox.lock().await;
+        s.container_mounts.insert(cid.clone(), m);
+
+        update_container_namespaces(&s, &mut oci, use_sandbox_pidns)?;
+
+        // Append guest hooks
+        append_guest_hooks(&s, &mut oci)?;
+
+        // write spec to bundle path, hooks might
+        // read ocispec
+        let olddir = setup_bundle(&cid, &mut oci)?;
+        // restore the cwd for kata-agent process.
+        defer!(unistd::chdir(&olddir).unwrap());
+
+        // determine which cgroup driver to take and then assign to use_systemd_cgroup
+        // systemd: "[slice]:[prefix]:[name]"
+        // fs: "/path_a/path_b"
+        // If agent is init we can't use systemd cgroup mode, no matter what the host tells us
+        let cgroups_path = &oci
+            .linux()
+            .as_ref()
+            .and_then(|linux| linux.cgroups_path().as_ref())
+            .map(|cgrps_path| cgrps_path.display().to_string())
+            .unwrap_or_default();
+
+        let use_systemd_cgroup = if self.init_mode {
+            false
+        } else {
+            SYSTEMD_CGROUP_PATH_FORMAT.is_match(cgroups_path)
+        };
+
+        let opts = CreateOpts {
+            cgroup_name: "".to_string(),
+            use_systemd_cgroup,
+            no_pivot_root: s.no_pivot_root,
+            no_new_keyring: false,
+            spec: Some(oci.clone()),
+            rootless_euid: false,
+            rootless_cgroup: false,
+            container_name,
+        };
+
+        let mut ctr: LinuxContainer = LinuxContainer::new(
+            cid.as_str(),
+            CONTAINER_BASE,
+            Some(s.devcg_info.clone()),
+            opts,
+            &sl(),
+        )?;
+
+        let pipe_size = AGENT_CONFIG.container_pipe_size;
+
+        let Some(p) = oci.process() else {
+            info!(sl(), "no process configurations!");
+            return Err(anyhow!(nix::Error::EINVAL));
+        };
+
+        let new_p = confidential_data_hub::image::get_process(p, &oci, req.storages.clone())?;
+        let p = Process::new(&sl(), &new_p, cid.as_str(), true, pipe_size, proc_io)?;
+
+    
+        let empty_namespaces: Vec<String> = Vec::new();
+        ctr.restore(p,&req.work_path, &req.image_path, false, false, false, false, false, &empty_namespaces, "");
+        // if let Err(err) = ctr.start(p).await {
+        //     error!(sl(), "failed to start container: {:?}", err);
+        //     if let Err(e) = ctr.destroy().await {
+        //         error!(sl(), "failed to destroy container: {:?}", e);
+        //     }
+        //     if let Err(e) = remove_container_resources(&mut s, &cid).await {
+        //         error!(sl(), "failed to remove container resources: {:?}", e);
+        //     }
+        //     return Err(err);
+        // }
+
+        s.update_shared_pidns(&ctr)?;
+        s.setup_shared_mounts(&ctr, &req.shared_mounts)?;
+        s.add_container(ctr);
+        info!(sl(), "created container!");
+
+        Ok(())
+    }
+
     #[instrument]
     async fn do_start_container(&self, req: protocols::agent::StartContainerRequest) -> Result<()> {
         let mut s = self.sandbox.lock().await;

@@ -2,22 +2,27 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-ARG GO_VERSION=
+# ARG GO_VERSION=1.25.12
 
-FROM busybox:1.37.0 AS resources
+FROM docker.1ms.run/busybox:1.37.0 AS resources
 
 WORKDIR /usr/local
 
-ARG PROTOC_VERSION=
-RUN wget -O /tmp/protoc.zip https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip && \
-    unzip /tmp/protoc.zip
+ARG PROTOC_VERSION=v21.12
+ADD protoc.zip /tmp/
+RUN unzip /tmp/protoc.zip
 
-FROM golang:${GO_VERSION}
+FROM docker.1ms.run/golang:1.25.12
 
 COPY --from=resources /usr/local /usr
 
-ARG PROTOC_GEN_GO_VERSION=
+ARG PROTOC_GEN_GO_VERSION=v1.28.1
 RUN go install google.golang.org/protobuf/cmd/protoc-gen-go@${PROTOC_GEN_GO_VERSION}
-ARG TTRPC_VERSION=
+ARG TTRPC_VERSION=v1.2.7
+# ENV GOPROXY=https://goproxy.cn
+
+# ENV HTTP_PROXY=http://proxyhk.zte.com.cn:80
+# ENV HTTPS_PROXY=http://proxyhk.zte.com.cn:80
+# ENV NO_PROXY=${NO_PROXY}
 RUN go install github.com/containerd/ttrpc/cmd/protoc-gen-go-ttrpc@${TTRPC_VERSION}
 RUN go install github.com/containerd/ttrpc/cmd/protoc-gen-gogottrpc@${TTRPC_VERSION}

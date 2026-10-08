@@ -655,6 +655,7 @@ impl Container {
     pub async fn checkpoint(
         &self,
         container_id: String,
+        console_socket:String,
         work_dir: String,
         path: String,
         exit: bool,

@@ -78,11 +78,14 @@ pub const EXEC_FIFO_FILENAME: &str = "exec.fifo";
 use kata_sys_util::mount::get_mount_type;
 use kata_sys_util::spec::get_bundle_path;
 use oci_spec::runtime::LinuxNamespaceType;
+use rust_criu::rust_criu_protobuf::rpc::Criu_notify;
 use rust_criu::{criu_ns_to_key, Criu};
+use std::cell::RefCell;
 use std::fs::{read_link, remove_dir, DirBuilder};
 use std::io::BufRead;
 use std::os::unix::fs::DirBuilderExt;
-
+use std::os::unix::net::UnixStream;
+use std::io::IoSlice;
 use log::{info as log_info, LevelFilter};
 use simplelog::{Config as SimpleLogConfig, WriteLogger};
 
@@ -101,6 +104,8 @@ const DESCRIPTORS_JSON: &str = "descriptors.json";
 const CRIU_CHECKPOINT_LOG_FILE: &str = "dump.log";
 pub const DEFAULT_CGROUP_ROOT: &str = "/sys/fs/cgroup";
 const CRIU_RESTORE_LOG_FILE: &str = "restore.log";
+const PTMX_PATH: &[u8] = b"/dev/ptmx";
+use nix::sys::socket::{self, UnixAddr};
 
 #[derive(Debug)]
 pub struct ContainerStatus {
@@ -258,6 +263,7 @@ pub trait BaseContainer {
     fn stats(&self) -> Result<StatsContainerResponse>;
     fn set(&mut self, config: LinuxResources) -> Result<()>;
     async fn start(&mut self, p: Process) -> Result<()>;
+    // async fn restore(&mut self, p: Process,opts:CheckpointOptions) -> Result<()>;
     async fn run(&mut self, p: Process) -> Result<()>;
     async fn destroy(&mut self) -> Result<()>;
     async fn exec(&mut self) -> Result<()>;
@@ -330,6 +336,21 @@ pub trait Container: BaseContainer {
         empty_namespaces: &[String],
         parent_path: &str,
     ) -> Result<()>;
+
+    fn restore(
+        &mut self,
+        p: Process,
+        console_socket:&str,
+        work_dir: &str,
+        path: &str,
+        exited: bool,
+        allow_open_tcp: bool,
+        allow_external_unix_sockets: bool,
+        allow_terminal: bool,
+        file_locks: bool,
+        _empty_namespaces: &[String],
+        parent_path: &str,
+    )-> Result<()>;
 }
 
 pub fn check_criu_version(min_version: u32) -> Result<()> {
@@ -352,6 +373,84 @@ fn compare_criu_version(version: u32, min_version: u32) -> Result<()> {
     }
     Ok(())
 }
+
+struct RestoreContext {
+   process:Process,
+   console_socket: Option<PathBuf>,
+}
+ 
+
+thread_local! {
+    static RESTORE_CTX: RefCell<Option<RestoreContext>> = const { RefCell::new(None) };
+}
+
+fn send_pts_master(
+    console_socket: &Path,
+    master_fd: RawFd,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(console_socket)?;
+    send_pty_master(stream.as_raw_fd(), master_fd)?;
+    Ok(())
+}
+
+
+fn send_pty_master(console_fd: RawFd, master_fd: RawFd) -> nix::Result<usize> {
+    let iov = [IoSlice::new(PTMX_PATH)];
+    let fds = [master_fd];
+    let cmsg = socket::ControlMessage::ScmRights(&fds);
+    socket::sendmsg::<UnixAddr>(console_fd, &iov, &[cmsg], socket::MsgFlags::empty(), None)
+}
+
+fn restore_callback(script: &str, notify: &Criu_notify, fd: Option<RawFd>) -> i32 {
+    match script {
+        "post-restore" => {
+            let pid = notify.pid();
+            RESTORE_CTX.with(|ctx| {
+                let mut borrow = ctx.borrow_mut();
+                let Some(context) = borrow.as_mut() else {
+                    return -1;
+                };
+                context.process.pid = pid;
+                0
+            })
+        }
+        "orphan-pts-master" => {
+            let Some(master_fd) = fd else {
+                return -1;
+            };
+    
+            RESTORE_CTX.with(|ctx| {
+                let borrow = ctx.borrow();
+                let Some(context) = borrow.as_ref() else {
+                    return -1;
+                };
+                let Some(ref console_socket) = context.console_socket else {
+                    return 0;
+                };
+                match send_pts_master(console_socket, master_fd) {
+                    Ok(()) => {
+                        0
+                    }
+                    Err(e) => {
+                        -1
+                    }
+                }
+            })
+        }
+        "network-lock" => {
+            0
+        }
+        "network-unlock" => {
+            0
+        }
+        "setup-namespaces" => {
+            0
+        }
+        _ => 0,
+    }
+}
+
+
 
 pub fn list_subsystem_mount_points() -> Result<Vec<PathBuf>> {
     let file = std::fs::File::open("/proc/self/mountinfo")?;
@@ -943,6 +1042,128 @@ impl Container for LinuxContainer {
         log_info!("checkpoint ok test004a");
         Ok(())
     }
+
+    fn restore(
+        &mut self,
+        p: Process,
+        console_socket:&str,
+        work_dir: &str,
+        path: &str,
+        exited: bool,
+        allow_open_tcp: bool,
+        allow_external_unix_sockets: bool,
+        allow_terminal: bool,
+        file_locks: bool,
+        _empty_namespaces: &[String],
+        parent_path: &str,
+    ) -> Result<()> {
+        check_criu_version(CRIU_VERSION_MINIMUM)?;
+        // p.wait()
+        let mut criu =
+            rust_criu::Criu::new().map_err(|e| anyhow!("error in creating criu struct: {}", e))?;
+
+        let directory = std::fs::File::open(path)
+            .map_err(|err| anyhow!("failed to open checkpoint directory: {}", err))?;
+        criu.set_images_dir_fd(directory.as_raw_fd());
+
+        // let work_dir: File;
+        // if let Some(wp) = &opts.work_path {
+        //     work_dir = File::open(wp).map_err(LibcontainerError::OtherIO)?;
+        //     criu.set_work_dir_fd(work_dir.as_raw_fd());
+        // }
+
+        let work_dir = std::fs::File::open(work_dir)
+            .map_err(|err| anyhow!("failed to open work_dir directory: {}", err))?;
+        criu.set_work_dir_fd(work_dir.as_raw_fd());
+
+        let criu_root = Path::new(&self.root).join("criu-root");
+        fs::create_dir_all(&criu_root).map_err(|err| anyhow!("failed to create dir: {}", err))?;
+
+        let spec_file = Path::new(&self.root).join("config.json");
+        let spec = oci::Spec::load(spec_file)?;
+
+        let root = spec
+            .root()
+            .as_ref()
+            .ok_or_else(|| anyhow!("spec has no root"))?;
+        let rootfs_path = root.path();
+
+        if !rootfs_path.exists() {
+            return Err(anyhow!(
+                "rootfs does not exist at {:?}",
+                rootfs_path.to_str()
+            ));
+        }
+
+        mount(
+            Some(rootfs_path.as_path()),
+            &criu_root,
+            None::<&str>,
+            MsFlags::MS_BIND | MsFlags::MS_REC,
+            None::<&str>,
+        )
+        .map_err(|err| anyhow!("failed to bind mount rootfs: {}", err))?;
+
+        let _cleanup = scopeguard::guard((), |_| {
+            let _ = umount2(&criu_root, MntFlags::MNT_DETACH);
+            let _ = remove_dir(&criu_root);
+        });
+
+        criu.set_log_file(CRIU_RESTORE_LOG_FILE.to_string());
+        criu.set_log_level(4);
+        criu.set_ext_unix_sk(false);
+        criu.set_shell_job(false);
+        criu.set_tcp_established(false);
+        criu.set_file_locks(false);
+        criu.set_orphan_pts_master(true);
+        criu.set_manage_cgroups(true);
+        criu.cgroups_mode(rust_criu::CgMode::SOFT);
+        criu.set_notify_scripts(true);
+        criu.set_rst_sibling(true);
+        let bundle_path = get_bundle_path()?;
+        criu.set_root(bundle_path.clone().into_os_string().into_string().unwrap());
+
+        // TODO: set EvasiveDevices flag (criu.set_evasive_devices(true)) once rust-criu exposes
+        // this option. runc sets EvasiveDevices: true unconditionally on restore.
+        // Ref: runc Restore() in criu_linux.go
+
+        // TODO: read org.criu.config OCI annotation and /etc/criu/runc.conf global config,
+        // pass path to criu.set_config_file() (runc: handleCriuConfigurationFile).
+        // Ref: runc Restore() in criu_linux.go
+
+        // TODO: implement prepareCriuRestoreMounts equivalent.
+        // runc calls prepareCriuRestoreMounts() to pre-create missing mount point
+        // directories/files inside rootfs and temporarily bind-mount them so that
+        // CRIU can attach the external mounts. Without this, restore may fail when
+        // a bind-mount destination does not exist in the rootfs image.
+        // Ref: runc prepareCriuRestoreMounts() in criu_linux.go
+
+        // Configure external mounts for CRIU
+        // This follows the runc pattern of addCriuRestoreMount
+        configure_external_mounts(&mut criu, &spec, &rootfs_path, &criu_root)?;
+        let image_path = PathBuf::from(path);
+        register_pipe_descriptors(&mut criu, &image_path)?;
+        let mut extra_files: Vec<std::fs::File> = Vec::new();
+        handle_restoring_namespaces(&mut criu, &spec, &mut extra_files)?;
+
+        criu.set_notify_cb(restore_callback);
+        RESTORE_CTX.with(|ctx| {
+            *ctx.borrow_mut() = Some(RestoreContext {
+                process: p,
+                console_socket: Some(PathBuf::from(console_socket)),
+            });
+        });
+        
+        let result = criu
+            .restore()
+            .with_context(|| format!("restoring container id={}", self.id()));
+
+        // Clear callback context
+        RESTORE_CTX.with(|ctx| {
+            *ctx.borrow_mut() = None;
+        });
+        result
+    }
 }
 
 pub fn init_child() {
@@ -1475,6 +1696,19 @@ fn set_stdio_permissions(uid: Uid) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+pub struct CheckpointOptions {
+    pub work_dir: String,
+    pub path: String,
+    pub exited: bool,
+    pub allow_open_tcp: bool,
+    pub allow_external_unix_sockets: bool,
+    pub allow_terminal: bool,
+    pub file_locks: bool,
+    pub empty_namespaces: Vec<String>,
+    pub parent_path: String,
 }
 
 #[async_trait]
