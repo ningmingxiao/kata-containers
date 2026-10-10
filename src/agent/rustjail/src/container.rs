@@ -782,7 +782,7 @@ fn do_init_child(cwfd: RawFd) -> Result<()> {
     let _ = unistd::close(crfd);
     let _ = unistd::close(cwfd);
 
-    if oci_process.terminal().unwrap_or_default() {
+    if init || oci_process.terminal().unwrap_or_default() {
         unistd::setsid().context("create a new session")?;
         unsafe { libc::ioctl(0, libc::TIOCSCTTY) };
     }

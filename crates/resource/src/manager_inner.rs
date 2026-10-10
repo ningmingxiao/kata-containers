@@ -1,0 +1,901 @@
+// Copyright (c) 2019-2022 Alibaba Cloud
+// Copyright (c) 2019-2022 Ant Group
+//
+// SPDX-License-Identifier: Apache-2.0
+//
+
+use std::{collections::HashMap, sync::Arc, thread};
+
+use agent::{types::Device, ARPNeighbor, Agent, OnlineCPUMemRequest, Storage};
+use anyhow::{anyhow, Context, Result};
+use async_trait::async_trait;
+use hypervisor::{
+    device::{
+        device_manager::{do_handle_device, get_block_device_info, DeviceManager},
+        util::{get_host_path, DEVICE_TYPE_CHAR},
+        DeviceConfig, DeviceType,
+    },
+    utils::uses_native_ccw_bus,
+    BlockConfig, BlockDeviceAio, Hypervisor, VfioConfig,
+};
+use kata_types::mount::{kata_guest_sandbox_dir, Mount, KATA_EPHEMERAL_VOLUME_TYPE, SHM_DIR};
+use kata_types::{
+    config::{hypervisor::TopologyConfigInfo, TomlConfig},
+    mount::{adjust_rootfs_mounts, KATA_IMAGE_FORCE_GUEST_PULL},
+};
+use libc::NUD_PERMANENT;
+use oci::{Linux, LinuxCpu, LinuxResources};
+use oci_spec::runtime::{self as oci, LinuxDeviceType};
+use persist::sandbox_persist::Persist;
+use std::path::PathBuf;
+use tokio::{runtime, sync::RwLock};
+
+use crate::{
+    cdi_devices::{sort_options_by_pcipath, ContainerDevice, DeviceInfo},
+    cgroups::{CgroupArgs, CgroupsResource},
+    cpu_mem::{
+        cpu::CpuResource, initial_size::InitialSizeManager, mem::MemResource, swap::SwapResource,
+    },
+    manager::ManagerArgs,
+    network::{self, dan_config_path, Network, NetworkConfig, NetworkWithNetNsConfig},
+    resource_persist::ResourceState,
+    rootfs::{RootFsResource, Rootfs},
+    share_fs::{self, sandbox_bind_mounts::SandboxBindMounts, ShareFs},
+    volume::{Volume, VolumeResource},
+    ResourceConfig, ResourceUpdateOp,
+};
+
+pub(crate) struct ResourceManagerInner {
+    sid: String,
+    toml_config: Arc<TomlConfig>,
+    agent: Arc<dyn Agent>,
+    hypervisor: Arc<dyn Hypervisor>,
+    device_manager: Arc<RwLock<DeviceManager>>,
+    network: Option<Arc<dyn Network>>,
+    share_fs: Option<Arc<dyn ShareFs>>,
+
+    pub rootfs_resource: RootFsResource,
+    pub volume_resource: VolumeResource,
+    pub cgroups_resource: CgroupsResource,
+    pub cpu_resource: CpuResource,
+    pub mem_resource: MemResource,
+    pub swap_resource: Option<SwapResource>,
+}
+
+impl ResourceManagerInner {
+    pub(crate) async fn new(
+        sid: &str,
+        agent: Arc<dyn Agent>,
+        hypervisor: Arc<dyn Hypervisor>,
+        toml_config: Arc<TomlConfig>,
+        init_size_manager: InitialSizeManager,
+    ) -> Result<Self> {
+        let topo_config = TopologyConfigInfo::new(&toml_config);
+        // create device manager
+        let dev_manager = DeviceManager::new(hypervisor.clone(), topo_config.as_ref())
+            .await
+            .context("failed to create device manager")?;
+        let device_manager = Arc::new(RwLock::new(dev_manager));
+
+        let cgroups_resource = CgroupsResource::new(sid, &toml_config)?;
+        let cpu_resource = CpuResource::new(toml_config.clone())?;
+        let mem_resource = MemResource::new(init_size_manager)?;
+        let swap_resource = if hypervisor
+            .hypervisor_config()
+            .await
+            .memory_info
+            .enable_guest_swap
+        {
+            let mut path = PathBuf::from(
+                hypervisor
+                    .hypervisor_config()
+                    .await
+                    .memory_info
+                    .guest_swap_path,
+            );
+            path.push(sid);
+            Some(
+                SwapResource::new(
+                    path,
+                    hypervisor
+                        .hypervisor_config()
+                        .await
+                        .memory_info
+                        .guest_swap_size_percent,
+                    hypervisor
+                        .hypervisor_config()
+                        .await
+                        .memory_info
+                        .guest_swap_create_threshold_secs,
+                    mem_resource.clone(),
+                    agent.clone(),
+                    device_manager.clone(),
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        Ok(Self {
+            sid: sid.to_string(),
+            toml_config,
+            agent,
+            hypervisor,
+            device_manager,
+            network: None,
+            share_fs: None,
+            rootfs_resource: RootFsResource::new(),
+            volume_resource: VolumeResource::new(),
+            cgroups_resource,
+            cpu_resource,
+            mem_resource,
+            swap_resource,
+        })
+    }
+
+    pub fn config(&self) -> Arc<TomlConfig> {
+        self.toml_config.clone()
+    }
+
+    pub fn get_device_manager(&self) -> Arc<RwLock<DeviceManager>> {
+        self.device_manager.clone()
+    }
+
+    pub async fn prepare_before_start_vm(
+        &mut self,
+        device_configs: Vec<ResourceConfig>,
+    ) -> Result<()> {
+        for dc in device_configs {
+            match dc {
+                ResourceConfig::ShareFs(c) => {
+                    self.share_fs = if self
+                        .hypervisor
+                        .capabilities()
+                        .await?
+                        .is_fs_sharing_supported()
+                    {
+                        let share_fs = share_fs::new(&self.sid, &c).context("new share fs")?;
+                        share_fs
+                            .setup_device_before_start_vm(
+                                self.hypervisor.as_ref(),
+                                &self.device_manager,
+                            )
+                            .await
+                            .context("setup share fs device before start vm")?;
+
+                        // setup sandbox bind mounts: setup = true
+                        self.handle_sandbox_bindmounts(true)
+                            .await
+                            .context("failed setup sandbox bindmounts")?;
+
+                        Some(share_fs)
+                    } else {
+                        None
+                    };
+                }
+                ResourceConfig::Network(c) => {
+                    self.handle_network(c)
+                        .await
+                        .context("failed to handle network")?;
+                }
+                ResourceConfig::VmRootfs(r) => {
+                    do_handle_device(&self.device_manager, &DeviceConfig::BlockCfg(r))
+                        .await
+                        .context("do handle device failed.")?;
+                }
+                ResourceConfig::HybridVsock(hv) => {
+                    do_handle_device(&self.device_manager, &DeviceConfig::HybridVsockCfg(hv))
+                        .await
+                        .context("do handle hybrid-vsock device failed.")?;
+                }
+                ResourceConfig::Vsock(v) => {
+                    do_handle_device(&self.device_manager, &DeviceConfig::VsockCfg(v))
+                        .await
+                        .context("do handle vsock device failed.")?;
+                }
+                ResourceConfig::Protection(p) => {
+                    do_handle_device(&self.device_manager, &DeviceConfig::ProtectionDevCfg(p))
+                        .await
+                        .context("do handle protection device failed.")?;
+                }
+                ResourceConfig::PortDevice(pd) => {
+                    do_handle_device(
+                        &self.device_manager,
+                        &DeviceConfig::PortDeviceCfg(pd.clone()),
+                    )
+                    .await
+                    .context("do handle port device failed.")?;
+                }
+                ResourceConfig::InitData(id) => {
+                    do_handle_device(&self.device_manager, &DeviceConfig::BlockCfg(id))
+                        .await
+                        .context("do handle initdata block device failed.")?;
+                }
+                ResourceConfig::VfioDeviceModern(vfiobase) => {
+                    do_handle_device(&self.device_manager, &DeviceConfig::VfioModernCfg(vfiobase))
+                        .await
+                        .context("do handle vfio device failed.")?;
+                }
+            };
+        }
+
+        Ok(())
+    }
+
+    pub async fn handle_network(&mut self, network_config: NetworkConfig) -> Result<()> {
+        // 1. When using Rust asynchronous programming, we use .await to
+        //    allow other task to run instead of waiting for the completion of the current task.
+        // 2. Also, when handling the pod network, we need to set the shim threads
+        //    into the network namespace to perform those operations.
+        // However, as the increase of the I/O intensive tasks, two issues could be caused by the two points above:
+        // a. When the future is blocked, the current thread (which is in the pod netns)
+        //    might be take over by other tasks. After the future is finished, the thread take over
+        //    the current task might not be in the pod netns. But the current task still need to run in pod netns
+        // b. When finish setting up the network, the current thread will be set back to the host namespace.
+        //    In Rust Async, if the current thread is taken over by other task, the netns is dropped on another thread,
+        //    but it is not in netns. So, the previous thread would still remain in the pod netns.
+        // The solution is to block the future on the current thread, it is enabled by spawn an os thread, create a
+        // tokio runtime, and block the task on it.
+        let device_manager = self.device_manager.clone();
+        let network = thread::spawn(move || -> Result<Arc<dyn Network>> {
+            let rt = runtime::Builder::new_current_thread().enable_io().build()?;
+            let d = rt
+                .block_on(network::new(&network_config, device_manager))
+                .context("new network")?;
+            rt.block_on(d.setup()).context("setup network")?;
+            Ok(d)
+        })
+        .join()
+        .map_err(|e| anyhow!("{:?}", e))
+        .context("Couldn't join on the associated thread")?
+        .context("failed to set up network")?;
+        self.network = Some(network);
+        Ok(())
+    }
+
+    async fn handle_interfaces(&self, network: &dyn Network) -> Result<()> {
+        for i in network.interfaces().await.context("get interfaces")? {
+            info!(sl!(), "update interface {:?}", i);
+
+            // After hotplugging a network device, the guest kernel needs time
+            // to probe it before the interface appears.  This is especially
+            // pronounced on s390x (CCW bus) but can also happen on x86 in
+            // slower CI environments.  Retry a few times.
+            let mut last_error = None;
+            for attempt in 0..10u32 {
+                match self
+                    .agent
+                    .update_interface(agent::UpdateInterfaceRequest {
+                        interface: Some(i.clone()),
+                    })
+                    .await
+                {
+                    core::result::Result::Ok(_) => {
+                        last_error = None;
+                        break;
+                    }
+                    core::result::Result::Err(e) => {
+                        debug!(
+                            sl!(),
+                            "update_interface attempt {} failed, retrying: {:?}",
+                            attempt + 1,
+                            e
+                        );
+                        last_error = Some(e);
+                        if attempt < 9 {
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        }
+                    }
+                }
+            }
+            if let Some(err) = last_error {
+                return Err(err).context("update interface");
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn handle_neighbours(&self, network: &dyn Network) -> Result<()> {
+        let all_neighbors = network.neighs().await.context("neighs")?;
+
+        // We add only static ARP entries
+        let neighbors: Vec<ARPNeighbor> = all_neighbors
+            .iter()
+            .filter(|n| n.state == NUD_PERMANENT as i32)
+            .cloned()
+            .collect();
+        if !neighbors.is_empty() {
+            info!(sl!(), "update neighbors {:?}", neighbors);
+            self.agent
+                .add_arp_neighbors(agent::AddArpNeighborRequest {
+                    neighbors: Some(agent::ARPNeighbors { neighbors }),
+                })
+                .await
+                .context("update neighbors")?;
+        }
+        Ok(())
+    }
+
+    async fn handle_routes(&self, network: &dyn Network) -> Result<()> {
+        let routes = network.routes().await.context("routes")?;
+        if !routes.is_empty() {
+            info!(sl!(), "update routes {:?}", routes);
+            self.agent
+                .update_routes(agent::UpdateRoutesRequest {
+                    route: Some(agent::Routes { routes }),
+                })
+                .await
+                .context("update routes")?;
+        }
+        Ok(())
+    }
+
+    pub async fn setup_after_start_vm(&mut self) -> Result<()> {
+        self.cgroups_resource
+            .setup_after_start_vm(self.hypervisor.as_ref())
+            .await
+            .context("setup cgroups after start vm")?;
+
+        if let Some(share_fs) = self.share_fs.as_ref() {
+            share_fs
+                .setup_device_after_start_vm(self.hypervisor.as_ref(), &self.device_manager)
+                .await
+                .context("setup share fs device after start vm")?;
+        }
+
+        if let Some(network) = self.network.as_ref() {
+            self.apply_network_to_agent(network.as_ref()).await?;
+        }
+
+        if let Some(swap) = self.swap_resource.as_ref() {
+            swap.update().await;
+        }
+
+        Ok(())
+    }
+
+    pub async fn apply_network_to_agent(&self, network: &dyn Network) -> Result<()> {
+        self.handle_interfaces(network)
+            .await
+            .context("handle interfaces")?;
+        self.handle_neighbours(network)
+            .await
+            .context("handle neighbors")?;
+        self.handle_routes(network).await.context("handle routes")?;
+        Ok(())
+    }
+
+    /// Check whether a rescan is needed at all (early-out conditions).
+    pub fn rescan_should_skip(&self, net_cfg: &NetworkWithNetNsConfig) -> bool {
+        self.toml_config.runtime.disable_new_netns
+            || net_cfg.network_model == "none"
+            || net_cfg.netns_path.is_empty()
+            || dan_config_path(&self.toml_config, &self.sid).exists()
+    }
+
+    /// Check whether the network already has interfaces configured.
+    pub async fn network_has_interfaces(&self) -> Result<bool> {
+        match self.network.as_ref() {
+            Some(n) => Ok(!n
+                .interfaces()
+                .await
+                .context("check existing interfaces")?
+                .is_empty()),
+            None => Ok(false),
+        }
+    }
+
+    /// Perform a single network scan attempt.  Returns `Some(network)` when
+    /// new interfaces were found and need to be applied to the guest agent,
+    /// `None` when no interfaces were found yet (caller should retry).
+    /// The caller is responsible for calling `apply_network_to_agent` on
+    /// the returned network **after** releasing the write lock.
+    pub async fn rescan_network_once(
+        &mut self,
+        net_cfg: NetworkWithNetNsConfig,
+    ) -> Result<Option<Arc<dyn Network>>> {
+        self.handle_network(NetworkConfig::NetNs(net_cfg))
+            .await
+            .context("rescan handle network")?;
+
+        let n = self
+            .network
+            .as_ref()
+            .ok_or_else(|| anyhow!("network missing after rescan setup"))?;
+        let ifs = n.interfaces().await.context("rescan get interfaces")?;
+        if !ifs.is_empty() {
+            return Ok(Some(Arc::clone(n)));
+        }
+        Ok(None)
+    }
+
+    pub async fn get_storage_for_sandbox(&self, shm_size: u64) -> Result<Vec<Storage>> {
+        let mut storages = vec![];
+        if let Some(d) = self.share_fs.as_ref() {
+            let mut s = d.get_storages().await.context("get storage")?;
+            storages.append(&mut s);
+        }
+
+        let shm_size_option = format!("size={shm_size}");
+        let mount_point = format!("{}/{}", kata_guest_sandbox_dir(), SHM_DIR);
+
+        let shm_storage = Storage {
+            driver: KATA_EPHEMERAL_VOLUME_TYPE.to_string(),
+            mount_point,
+            source: "shm".to_string(),
+            fs_type: "tmpfs".to_string(),
+            options: vec![
+                "noexec".to_string(),
+                "nosuid".to_string(),
+                "nodev".to_string(),
+                "mode=1777".to_string(),
+                shm_size_option,
+            ],
+            ..Default::default()
+        };
+
+        storages.push(shm_storage);
+
+        Ok(storages)
+    }
+
+    pub async fn handler_rootfs(
+        &self,
+        cid: &str,
+        root: &oci::Root,
+        bundle_path: &str,
+        rootfs_mounts: &[Mount],
+        annotations: &HashMap<String, String>,
+    ) -> Result<Arc<dyn Rootfs>> {
+        let adjust_rootfs_mounts = if !self
+            .config()
+            .runtime
+            .is_experiment_enabled(KATA_IMAGE_FORCE_GUEST_PULL)
+        {
+            rootfs_mounts.to_vec()
+        } else {
+            adjust_rootfs_mounts()?
+        };
+
+        self.rootfs_resource
+            .handler_rootfs(
+                &self.share_fs,
+                self.device_manager.as_ref(),
+                self.hypervisor.as_ref(),
+                &self.sid,
+                cid,
+                root,
+                bundle_path,
+                &adjust_rootfs_mounts,
+                annotations,
+            )
+            .await
+    }
+
+    pub async fn handler_volumes(
+        &self,
+        cid: &str,
+        spec: &oci::Spec,
+    ) -> Result<Vec<Arc<dyn Volume>>> {
+        let ctx = crate::volume::VolumeContext {
+            share_fs: &self.share_fs,
+            d: self.device_manager.as_ref(),
+            sid: &self.sid,
+            agent: self.agent.clone(),
+            emptydir_mode: &self.toml_config.runtime.emptydir_mode,
+        };
+        self.volume_resource.handler_volumes(&ctx, cid, spec).await
+    }
+
+    pub async fn handler_devices(&self, _cid: &str, linux: &Linux) -> Result<Vec<ContainerDevice>> {
+        let mut devices = vec![];
+
+        let linux_devices = linux.devices().clone().unwrap_or_default();
+        for d in linux_devices.iter() {
+            match d.typ() {
+                LinuxDeviceType::B => {
+                    let blkdev_info = get_block_device_info(&self.device_manager).await;
+                    let dev_info = DeviceConfig::BlockCfg(BlockConfig {
+                        major: d.major(),
+                        minor: d.minor(),
+                        driver_option: blkdev_info.block_device_driver,
+                        blkdev_aio: BlockDeviceAio::new(&blkdev_info.block_device_aio),
+                        num_queues: blkdev_info.num_queues,
+                        queue_size: blkdev_info.queue_size,
+                        logical_sector_size: blkdev_info.block_device_logical_sector_size,
+                        physical_sector_size: blkdev_info.block_device_physical_sector_size,
+                        ..Default::default()
+                    });
+
+                    let device_info = do_handle_device(&self.device_manager, &dev_info)
+                        .await
+                        .context("do handle device")?;
+
+                    // create block device for kata agent.
+                    // The device ID is derived from the available address: PCI, SCSI,
+                    // CCW, or virtual path, depending on the driver and configuration.
+                    if let DeviceType::Block(device) = device_info {
+                        let id = if let Some(pci_path) = device.config.pci_path {
+                            pci_path.to_string()
+                        } else if let Some(scsi_address) = device.config.scsi_addr {
+                            scsi_address
+                        } else if let Some(ccw_addr) = device.config.ccw_addr {
+                            ccw_addr
+                        } else {
+                            device.config.virt_path.clone()
+                        };
+
+                        let agent_device = Device {
+                            id,
+                            container_path: d.path().display().to_string().clone(),
+                            field_type: device.config.driver_option,
+                            vm_path: device.config.virt_path,
+                            ..Default::default()
+                        };
+                        devices.push(ContainerDevice {
+                            device_info: None,
+                            device: agent_device,
+                        });
+                    }
+                }
+                LinuxDeviceType::C => {
+                    let host_path = get_host_path(DEVICE_TYPE_CHAR, d.major(), d.minor())
+                        .context("get host path failed")?;
+                    // First of all, filter vfio devices.
+                    if !host_path.starts_with("/dev/vfio") {
+                        continue;
+                    }
+
+                    let bus_type = if uses_native_ccw_bus() {
+                        "ccw".to_string()
+                    } else {
+                        "pci".to_string()
+                    };
+                    let dev_info = DeviceConfig::VfioCfg(VfioConfig {
+                        host_path,
+                        dev_type: "c".to_string(),
+                        bus_type: bus_type.clone(),
+                        hostdev_prefix: "vfio_device".to_owned(),
+                        ..Default::default()
+                    });
+
+                    let device_info = do_handle_device(&self.device_manager.clone(), &dev_info)
+                        .await
+                        .context("do handle device")?;
+
+                    if let DeviceType::VfioModern(vfio_dev) = device_info.clone() {
+                        info!(sl!(), "device info: {:?}", vfio_dev.lock().await);
+                        let vfio_device = vfio_dev.lock().await;
+                        let guest_pci_path = vfio_device
+                            .config
+                            .guest_pci_path
+                            .clone()
+                            .context("VFIO device has no guest PCI path assigned")?;
+                        let host_bdf = vfio_device.device.primary.addr.to_string();
+                        info!(
+                            sl!(),
+                            "vfio device guest pci path: {:?}, host bdf: {:?}",
+                            guest_pci_path,
+                            &host_bdf
+                        );
+
+                        // vfio mode: vfio-pci and vfio-pci-gk for x86_64
+                        // - vfio-pci, devices appear as VFIO character devices under /dev/vfio in container.
+                        // - vfio-pci-gk, devices are managed by whatever driver in Guest kernel.
+                        // - vfio-ap, devices appear as VFIO character devices under /dev/vfio in container for ccw devices.
+                        let vfio_mode = match self.toml_config.runtime.vfio_mode.as_str() {
+                            "vfio" => {
+                                if bus_type == "ccw" {
+                                    "vfio-ap".to_string()
+                                } else {
+                                    "vfio-pci".to_string()
+                                }
+                            }
+                            _ => "vfio-pci-gk".to_string(),
+                        };
+                        let device_options = vec![format!("{}={}", host_bdf, guest_pci_path)];
+                        // The Go runtime sets the device Id to
+                        // filepath.Base(dev.ContainerPath), e.g. "vfio0".
+                        // The agent policy validates this with:
+                        //   i_vfio_device.id == concat("", ["vfio", suffix])
+                        let group_num = d
+                            .path()
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or_default()
+                            .to_string();
+                        let agent_device = Device {
+                            id: group_num,
+                            container_path: d.path().display().to_string().clone(),
+                            field_type: vfio_mode,
+                            options: device_options,
+                            ..Default::default()
+                        };
+
+                        let device_info = Some(DeviceInfo {
+                            vendor_id: vfio_device
+                                .device
+                                .primary
+                                .vendor_id
+                                .clone()
+                                .unwrap_or_default(),
+                            class_id: format!(
+                                "{:#08x}",
+                                vfio_device.device.primary.class_code.unwrap_or_default()
+                            ),
+                            host_path: d.path().clone(),
+                        });
+                        info!(
+                            sl!(),
+                            "vfio device info for agent: {:?}",
+                            device_info.clone()
+                        );
+                        info!(
+                            sl!(),
+                            "agent device info for agent: {:?}",
+                            agent_device.clone()
+                        );
+                        devices.push(ContainerDevice {
+                            device_info,
+                            device: agent_device,
+                        });
+                    } else {
+                        // vfio mode: vfio-pci and vfio-pci-gk for x86_64
+                        // - vfio-pci, devices appear as VFIO character devices under /dev/vfio in container.
+                        // - vfio-pci-gk, devices are managed by whatever driver in Guest kernel.
+                        // - vfio-ap, devices appear as VFIO character devices under /dev/vfio in container for ccw devices.
+                        let vfio_mode = match self.toml_config.runtime.vfio_mode.as_str() {
+                            "vfio" => {
+                                if bus_type == "ccw" {
+                                    "vfio-ap".to_string()
+                                } else {
+                                    "vfio-pci".to_string()
+                                }
+                            }
+                            _ => "vfio-pci-gk".to_string(),
+                        };
+
+                        // create agent device
+                        if let DeviceType::Vfio(device) = device_info {
+                            let device_options = sort_options_by_pcipath(device.device_options);
+                            let group_num = d
+                                .path()
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or_default()
+                                .to_string();
+                            let agent_device = Device {
+                                id: group_num,
+                                container_path: d.path().display().to_string().clone(),
+                                field_type: vfio_mode,
+                                options: device_options,
+                                ..Default::default()
+                            };
+
+                            let device_info = if let Some(device_vendor_class) =
+                                &device.devices.first().unwrap().device_vendor_class
+                            {
+                                let vendor_class = device_vendor_class
+                                    .get_vendor_class_id()
+                                    .context("get vendor class failed")?;
+                                Some(DeviceInfo {
+                                    vendor_id: vendor_class.0.to_owned(),
+                                    class_id: vendor_class.1.to_owned(),
+                                    host_path: d.path().clone(),
+                                })
+                            } else {
+                                None
+                            };
+                            devices.push(ContainerDevice {
+                                device_info,
+                                device: agent_device,
+                            });
+                        }
+                    }
+                }
+                _ => {
+                    // TODO enable other devices type
+                    continue;
+                }
+            }
+        }
+        Ok(devices)
+    }
+
+    async fn handle_sandbox_bindmounts(&self, setup: bool) -> Result<()> {
+        let bindmounts = self.toml_config.runtime.sandbox_bind_mounts.clone();
+        if bindmounts.is_empty() {
+            info!(sl!(), "sandbox bindmounts empty, just skip it.");
+            return Ok(());
+        }
+
+        let sb_bindmnt = SandboxBindMounts::new(self.sid.clone(), bindmounts)?;
+
+        if setup {
+            sb_bindmnt.setup_sandbox_bind_mounts()
+        } else {
+            sb_bindmnt.cleanup_sandbox_bind_mounts()
+        }
+    }
+
+    pub async fn cleanup(&self) -> Result<()> {
+        // clean up cgroup
+        self.cgroups_resource
+            .delete()
+            .await
+            .context("delete cgroup")?;
+
+        // cleanup sandbox bind mounts: setup = false
+        self.handle_sandbox_bindmounts(false)
+            .await
+            .context("failed to cleanup sandbox bindmounts")?;
+
+        // clean up share fs mount
+        if let Some(share_fs) = &self.share_fs {
+            share_fs
+                .get_share_fs_mount()
+                .cleanup(&self.sid)
+                .await
+                .context("failed to cleanup host path")?;
+        }
+
+        if let Some(swap) = self.swap_resource.as_ref() {
+            swap.clean().await;
+        }
+
+        self.volume_resource
+            .cleanup_ephemeral_disks()
+            .await
+            .context("failed to cleanup ephemeral disks")?;
+
+        Ok(())
+    }
+
+    pub async fn dump(&self) {
+        self.rootfs_resource.dump().await;
+        self.volume_resource.dump().await;
+    }
+
+    pub async fn update_linux_resource(
+        &self,
+        cid: &str,
+        linux_resources: Option<&LinuxResources>,
+        op: ResourceUpdateOp,
+    ) -> Result<Option<LinuxResources>> {
+        let linux_cpus = || -> Option<&LinuxCpu> { linux_resources.as_ref()?.cpu().as_ref() }();
+
+        // if static_sandbox_resource_mgmt, we will not have to update sandbox's cpu or mem resource
+        if !self.toml_config.runtime.static_sandbox_resource_mgmt {
+            // update cpu
+            self.cpu_resource
+                .update_cpu_resources(cid, linux_cpus, op, self.hypervisor.as_ref())
+                .await?;
+            // update memory
+            self.mem_resource
+                .update_mem_resources(cid, linux_resources, op, self.hypervisor.as_ref())
+                .await?;
+
+            self.agent
+                .online_cpu_mem(OnlineCPUMemRequest {
+                    wait: false,
+                    nb_cpus: self.cpu_resource.current_vcpu().await.ceil() as u32,
+                    cpu_only: false,
+                })
+                .await
+                .context("online vcpus")?;
+        }
+
+        // we should firstly update the vcpus and mems, and then update the host cgroups
+        self.cgroups_resource
+            .update(cid, linux_resources, op, self.hypervisor.as_ref())
+            .await?;
+
+        if let Some(swap) = self.swap_resource.as_ref() {
+            swap.update().await;
+        }
+
+        // update the linux resources for agent
+        self.agent_linux_resources(linux_resources)
+    }
+
+    fn agent_linux_resources(
+        &self,
+        linux_resources: Option<&LinuxResources>,
+    ) -> Result<Option<LinuxResources>> {
+        let mut resources = match linux_resources {
+            Some(linux_resources) => linux_resources.clone(),
+            None => {
+                return Ok(None);
+            }
+        };
+
+        // clear the cpuset
+        // for example, if there are only 5 vcpus now, and the cpuset in LinuxResources is 0-2,6, guest os will report
+        // error when creating the container. so we choose to clear the cpuset here.
+        if let Some(cpu) = &mut resources.cpu_mut() {
+            cpu.set_cpus(None);
+        }
+
+        Ok(Some(resources))
+    }
+}
+
+#[async_trait]
+impl Persist for ResourceManagerInner {
+    type State = ResourceState;
+    type ConstructorArgs = ManagerArgs;
+
+    /// Save a state of ResourceManagerInner
+    async fn save(&self) -> Result<Self::State> {
+        let mut endpoint_state = vec![];
+        if let Some(network) = &self.network {
+            if let Some(ens) = network.save().await {
+                endpoint_state = ens;
+            }
+        }
+        let cgroup_state = self.cgroups_resource.save().await?;
+        Ok(ResourceState {
+            endpoint: endpoint_state,
+            cgroup_state: Some(cgroup_state),
+        })
+    }
+
+    /// Restore ResourceManagerInner
+    async fn restore(
+        resource_args: Self::ConstructorArgs,
+        resource_state: Self::State,
+    ) -> Result<Self> {
+        let args = CgroupArgs {
+            sid: resource_args.sid.clone(),
+            config: resource_args.config,
+        };
+        let topo_config = TopologyConfigInfo::new(&args.config);
+
+        let mem_resource = MemResource::default();
+        let device_manager = Arc::new(RwLock::new(
+            DeviceManager::new(resource_args.hypervisor.clone(), topo_config.as_ref()).await?,
+        ));
+
+        let swap_resource = if resource_args
+            .hypervisor
+            .hypervisor_config()
+            .await
+            .memory_info
+            .enable_guest_swap
+        {
+            let mut path = PathBuf::from(
+                resource_args
+                    .hypervisor
+                    .hypervisor_config()
+                    .await
+                    .memory_info
+                    .guest_swap_path,
+            );
+            path.push(resource_args.sid.clone());
+            Some(SwapResource::restore(path).await)
+        } else {
+            None
+        };
+
+        Ok(Self {
+            sid: resource_args.sid,
+            agent: resource_args.agent,
+            hypervisor: resource_args.hypervisor,
+            device_manager,
+            network: None,
+            share_fs: None,
+            rootfs_resource: RootFsResource::new(),
+            volume_resource: VolumeResource::new(),
+            cgroups_resource: CgroupsResource::restore(
+                args,
+                resource_state.cgroup_state.unwrap_or_default(),
+            )
+            .await?,
+            toml_config: Arc::new(TomlConfig::default()),
+            cpu_resource: CpuResource::default(),
+            mem_resource,
+            swap_resource,
+        })
+    }
+}
