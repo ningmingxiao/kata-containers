@@ -17,9 +17,10 @@ build_rootfs() {
 		EXTRA_PKGS=$(echo "${EXTRA_PKGS}" | tr ' ' ',')
 	fi
 	# shellcheck disable=SC2154
+	THIRD_PARTY_PPA="deb [trusted=yes] https://ppa.launchpadcontent.net/criu/ppa/ubuntu ${OS_VERSION} main"
 	if ! mmdebstrap --mode auto --arch "${DEB_ARCH}" --variant required \
 			--components="${REPO_COMPONENTS}" \
-			--include "${PACKAGES},${EXTRA_PKGS}" "${OS_VERSION}" "${rootfs_dir}" "${REPO_URL}"; then
+			--include "${PACKAGES},${EXTRA_PKGS}" "${OS_VERSION}" "${rootfs_dir}" "${REPO_URL}" "${THIRD_PARTY_PPA}"; then
 		echo "ERROR: mmdebstrap failed, cannot proceed" && exit 1
 	else
 		echo "INFO: mmdebstrap succeeded"
