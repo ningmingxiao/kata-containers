@@ -127,6 +127,7 @@ configuration-file option** in the Go runtime.
 | Option | Purpose in `runtime-rs` |
 | --- | --- |
 | `vm_rootfs_driver` | Dedicated block driver for the VM rootfs (`virtio-pmem`, `virtio-blk-pci`, `virtio-blk-mmio`), separate from `block_device_driver`. |
+| `erofs_rootfs_driver` | Driver for the read-only EROFS image layers (`virtio-pmem`). Only the Cloud Hypervisor driver supports it. |
 | `queue_size` | virtio queue size, in bytes, for block devices. |
 | `num_queues` | Block device multi-queue count. |
 | `network_queues` | Number of `virtio-net` RX/TX queue pairs exposed to the guest. |

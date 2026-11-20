@@ -109,7 +109,9 @@ impl CloudHypervisorInner {
     }
 
     pub fn set_hypervisor_config(&mut self, mut config: HypervisorConfig) {
-        // virtio-pmem is not supported for Cloud Hypervisor.
+        // virtio-pmem is not supported for the Cloud Hypervisor VM rootfs: the
+        // boot image is always attached through the disk API. Container EROFS
+        // layers can still opt into virtio-pmem through `erofs_rootfs_driver`.
         if config.boot_info.vm_rootfs_driver == crate::VM_ROOTFS_DRIVER_PMEM {
             config.boot_info.vm_rootfs_driver = crate::VM_ROOTFS_DRIVER_BLK.to_string();
         }

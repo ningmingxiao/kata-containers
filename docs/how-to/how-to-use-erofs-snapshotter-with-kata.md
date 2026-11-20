@@ -237,6 +237,28 @@ shared_fs = "none"
 > keep `shared_fs = "virtio-fs"` so that non-EROFS containers can still use
 > virtio-fs.
 
+#### Using virtio-pmem for the EROFS layers (Cloud Hypervisor)
+
+With the Cloud Hypervisor driver, the read-only EROFS layers can be attached as
+`virtio-pmem` (NVDIMM) devices instead of virtio-blk devices. The guest maps
+the image data directly from host memory, so the image is not copied into guest
+RAM. Set `erofs_rootfs_driver` in the `[hypervisor.clh]` section:
+
+```toml
+[hypervisor.clh]
+shared_fs = "none"
+erofs_rootfs_driver = "virtio-pmem"
+```
+
+The writable upper layer and regular volumes keep using
+`block_device_driver`. Only raw, single-device EROFS images can be attached
+this way: multi-layer images are merged into a VMDK, which Cloud Hypervisor
+does not support, so those containers must keep using the default driver.
+
+The same setting can be passed as the
+`io.katacontainers.config.hypervisor.erofs_rootfs_driver` pod annotation. The
+annotation is disabled by default, so add `erofs_rootfs_driver` to the
+hypervisor's `enable_annotations` list first.
 
 ### Quick Test
 
@@ -407,8 +429,8 @@ If `vmdk` does not appear, you need to rebuild QEMU with VMDK support enabled.
 >
 > For single-layer EROFS (only one `.erofs` blob, no `device=` extra layers),
 > the blob is attached as a raw block device without a VMDK descriptor. This
-> mode may work with other hypervisors that support raw virtio-blk devices,
-> but has not been fully tested.
+> mode also works with Cloud Hypervisor, either as a raw virtio-blk device or,
+> when `erofs_rootfs_driver = "virtio-pmem"` is set, as a virtio-pmem device.
 
 ## References
 

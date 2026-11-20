@@ -575,4 +575,30 @@ mod tests {
         let mut config = TomlConfig::load(content).unwrap();
         assert!(anno.update_config_by_annotation(&mut config).is_err());
     }
+
+    #[test]
+    fn test_erofs_rootfs_driver_is_cloud_hypervisor_only() {
+        let qemu = QemuConfig::new();
+        qemu.register();
+
+        let content = r#"
+[hypervisor.qemu]
+path = "/bin/echo"
+kernel = "/bin/echo"
+image = "/bin/echo"
+firmware = ""
+erofs_rootfs_driver = "virtio-pmem"
+
+[runtime]
+hypervisor_name = "qemu"
+"#;
+
+        let config = TomlConfig::load(content).unwrap();
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("erofs_rootfs_driver"),
+            "unexpected validation error: {}",
+            err
+        );
+    }
 }

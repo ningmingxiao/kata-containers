@@ -18,17 +18,18 @@ use crate::ProtectionDeviceConfig;
 use crate::ShareFsConfig;
 use crate::ShareFsDevice;
 use crate::VmmState;
-use crate::{BlockConfigModern, BlockDeviceModern};
+use crate::{BlockConfigModern, BlockDeviceModern, KATA_NVDIMM_DEV_TYPE};
 use anyhow::{anyhow, ensure, Context, Result};
 use ch_config::ch_api::cloud_hypervisor_vm_device_add;
 use ch_config::ch_api::{
     cloud_hypervisor_vm_blockdev_add, cloud_hypervisor_vm_device_remove,
     cloud_hypervisor_vm_fs_add, cloud_hypervisor_vm_netdev_add_with_fds,
-    cloud_hypervisor_vm_vsock_add, PciDeviceInfo, VmRemoveDeviceData,
+    cloud_hypervisor_vm_pmem_add, cloud_hypervisor_vm_vsock_add, PciDeviceInfo, VmRemoveDeviceData,
 };
 use ch_config::convert::{DEFAULT_DISK_QUEUES, DEFAULT_DISK_QUEUE_SIZE, DEFAULT_NUM_PCI_SEGMENTS};
 use ch_config::DiskConfig;
 use ch_config::ImageType;
+use ch_config::PmemConfig;
 use ch_config::{
     net_util::MacAddr, DeviceConfig, FsConfig, NetConfig, ProtectionDevConfig, VsockConfig,
 };
@@ -336,6 +337,13 @@ impl CloudHypervisorInner {
             (dev.device_id.clone(), dev.config.clone())
         };
 
+        // virtio-pmem devices use a dedicated API and are only meaningful for
+        // read-only media. The read-only EROFS image layers are the only block
+        // devices Kata attaches this way.
+        if config.driver_option == KATA_NVDIMM_DEV_TYPE {
+            return self.handle_pmem_device(device, device_id, config).await;
+        }
+
         let disk_config = self.make_disk_config(&config)?;
 
         let response = cloud_hypervisor_vm_blockdev_add(&self.api_socket, disk_config).await?;
@@ -349,6 +357,47 @@ impl CloudHypervisorInner {
 
             // Persist the cloud-hypervisor assigned PCI path back into the device
             // so it can be used later for removal / hot-unplug.
+            let mut block_dev = device.lock().await;
+            block_dev.config.pci_path = Some(Self::clh_pci_info_to_path(dev_info.bdf.as_str())?);
+        }
+
+        Ok(DeviceType::BlockModern(device))
+    }
+
+    async fn handle_pmem_device(
+        &mut self,
+        device: Arc<Mutex<BlockDeviceModern>>,
+        device_id: String,
+        config: BlockConfigModern,
+    ) -> Result<DeviceType> {
+        // A pmem device is backed by a host file mapped into guest memory, so
+        // the guest could write straight through to the host page cache. Only
+        // read-only media may be attached this way.
+        if !config.is_readonly {
+            return Err(anyhow!(
+                "virtio-pmem block device {} must be read-only",
+                config.path_on_host
+            ));
+        }
+
+        // `discard_writes` makes cloud-hypervisor open the backing file
+        // read-only and discard any write the guest issues, which matches the
+        // read-only EROFS layers.
+        let pmem_config = PmemConfig {
+            file: PathBuf::from(&config.path_on_host),
+            discard_writes: true,
+            ..Default::default()
+        };
+
+        let response = cloud_hypervisor_vm_pmem_add(&self.api_socket, pmem_config).await?;
+
+        if let Some(detail) = response {
+            debug!(sl!(), "pmem add response: {:?}", detail);
+
+            let dev_info: PciDeviceInfo =
+                serde_json::from_str(detail.as_str()).map_err(|e| anyhow!(e))?;
+            self.device_ids.insert(device_id, dev_info.id);
+
             let mut block_dev = device.lock().await;
             block_dev.config.pci_path = Some(Self::clh_pci_info_to_path(dev_info.bdf.as_str())?);
         }
