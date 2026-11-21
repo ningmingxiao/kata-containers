@@ -52,6 +52,37 @@ use virtio_bindings::bindings::virtio_blk::VIRTIO_BLK_ID_BYTES;
 
 const VIRTIO_FS: &str = "virtio-fs";
 
+/// Alignment cloud-hypervisor requires for a virtio-pmem region.
+///
+/// The backing file is mapped into guest memory, so the region has to be
+/// 2 MiB aligned for the mapping to be hugepage backed. cloud-hypervisor
+/// derives the region size from the file length when the request does not
+/// carry one, which makes it reject any image whose length is not a multiple
+/// of 2 MiB.
+const CH_PMEM_REGION_ALIGNMENT: u64 = 2 * 1024 * 1024;
+
+/// Region size to request for a virtio-pmem backing file.
+///
+/// EROFS layers are ordinary image files whose length is not aligned to
+/// anything in particular, so the region is rounded up to the alignment
+/// cloud-hypervisor insists on. Rounding up is safe: EROFS takes its own size
+/// from the on-disk superblock and never reads the trailing padding, and the
+/// mapping is created with `MAP_NORESERVE` so the padding costs nothing until
+/// it is touched.
+fn pmem_region_size(file: &Path) -> Result<u64> {
+    let len = std::fs::metadata(file)
+        .with_context(|| format!("stat virtio-pmem backing file {}", file.display()))?
+        .len();
+
+    ensure!(
+        len > 0,
+        "virtio-pmem backing file {} is empty",
+        file.display()
+    );
+
+    Ok(len.div_ceil(CH_PMEM_REGION_ALIGNMENT) * CH_PMEM_REGION_ALIGNMENT)
+}
+
 impl CloudHypervisorInner {
     pub(crate) async fn add_device(&mut self, device: DeviceType) -> Result<DeviceType> {
         if let DeviceType::Network(net) = &device {
@@ -380,11 +411,16 @@ impl CloudHypervisorInner {
             ));
         }
 
+        let file = PathBuf::from(&config.path_on_host);
+
         // `discard_writes` makes cloud-hypervisor open the backing file
         // read-only and discard any write the guest issues, which matches the
-        // read-only EROFS layers.
+        // read-only EROFS layers. The explicit `size` keeps the region 2 MiB
+        // aligned, which cloud-hypervisor requires and which it cannot derive
+        // from an EROFS layer file.
         let pmem_config = PmemConfig {
-            file: PathBuf::from(&config.path_on_host),
+            size: Some(pmem_region_size(&file)?),
+            file,
             discard_writes: true,
             ..Default::default()
         };
@@ -868,5 +904,43 @@ mod tests {
                 assert!(error.to_string().contains("must be normalized"));
             }
         }
+    }
+
+    #[rstest]
+    #[case(1, 2 * 1024 * 1024)]
+    #[case(749_568, 2 * 1024 * 1024)]
+    #[case(2 * 1024 * 1024, 2 * 1024 * 1024)]
+    #[case(2 * 1024 * 1024 + 1, 4 * 1024 * 1024)]
+    fn test_pmem_region_size_rounds_up_to_alignment(#[case] file_len: u64, #[case] expected: u64) {
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("layer.erofs");
+        std::fs::File::create(&image)
+            .unwrap()
+            .set_len(file_len)
+            .unwrap();
+
+        assert_eq!(pmem_region_size(&image).unwrap(), expected);
+        assert_eq!(expected % CH_PMEM_REGION_ALIGNMENT, 0);
+    }
+
+    #[test]
+    fn test_pmem_region_size_rejects_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("empty.erofs");
+        std::fs::File::create(&image).unwrap();
+
+        let error = pmem_region_size(&image).unwrap_err();
+        assert!(error.to_string().contains("is empty"), "{}", error);
+    }
+
+    #[test]
+    fn test_pmem_region_size_rejects_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = pmem_region_size(&dir.path().join("absent.erofs")).unwrap_err();
+        assert!(
+            error.to_string().contains("stat virtio-pmem backing file"),
+            "{}",
+            error
+        );
     }
 }
