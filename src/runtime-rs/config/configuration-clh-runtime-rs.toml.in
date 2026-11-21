@@ -172,6 +172,18 @@ reclaim_guest_freed_memory = false
 # storage directly to the guest VM.
 block_device_driver = "virtio-blk-pci"
 
+# Block device driver used for the read-only EROFS layers of a container image
+# root filesystem (containerd erofs snapshotter).
+#
+# Setting this to "virtio-pmem" attaches those layers as virtio-pmem devices,
+# which the guest mounts read-only with DAX, keeping image data in the host page
+# cache instead of guest RAM. Only raw EROFS images are supported; layers merged
+# into a VMDK keep using `block_device_driver`.
+#
+# The writable upper layer and regular volumes always use `block_device_driver`.
+# An empty value uses `block_device_driver` for the EROFS layers too.
+erofs_rootfs_driver = ""
+
 # Specifies cache-related options for block devices.
 # Denotes whether use of O_DIRECT (bypass the host page cache) is enabled.
 # Default false

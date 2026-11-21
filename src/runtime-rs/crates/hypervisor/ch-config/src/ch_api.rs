@@ -3,7 +3,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    DeviceConfig, DiskConfig, FsConfig, NetConfig, VmConfig, VmInfo, VmResize, VsockConfig,
+    DeviceConfig, DiskConfig, FsConfig, NetConfig, PmemConfig, VmConfig, VmInfo, VmResize,
+    VsockConfig,
 };
 use anyhow::{anyhow, Context, Result};
 use api_client::simple_api_full_command_with_fds_and_response;
@@ -134,6 +135,14 @@ pub async fn cloud_hypervisor_vm_blockdev_add(
 ) -> Result<Option<String>> {
     let body = serde_json::to_string(&blk_config)?;
     api_command(api_socket, "PUT", "vm.add-disk", Some(body), None).await
+}
+
+pub async fn cloud_hypervisor_vm_pmem_add(
+    api_socket: &ApiSocket,
+    pmem_config: PmemConfig,
+) -> Result<Option<String>> {
+    let body = serde_json::to_string(&pmem_config)?;
+    api_command(api_socket, "PUT", "vm.add-pmem", Some(body), None).await
 }
 
 pub async fn cloud_hypervisor_vm_netdev_add(

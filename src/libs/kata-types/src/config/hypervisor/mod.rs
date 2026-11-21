@@ -238,6 +238,21 @@ pub struct BlockDeviceInfo {
     #[serde(default)]
     pub block_device_driver: String,
 
+    /// Block storage driver used for the read-only EROFS layers of a container
+    /// image root filesystem (the containerd erofs snapshotter).
+    ///
+    /// Setting this to `virtio-pmem` attaches those layers as virtio-pmem
+    /// (NVDIMM) devices instead of using `block_device_driver`, so the guest can
+    /// mount them read-only with DAX and keep the image data in the host page
+    /// cache rather than guest RAM. Only raw EROFS images are supported; layers
+    /// that are merged into a VMDK layout keep using `block_device_driver`.
+    ///
+    /// The writable upper layer and regular volumes always use
+    /// `block_device_driver`. An empty value uses `block_device_driver` for the
+    /// EROFS layers too.
+    #[serde(default)]
+    pub erofs_rootfs_driver: String,
+
     /// Block device AIO is the I/O mechanism specially for Qemu
     /// Options:
     ///
@@ -349,6 +364,7 @@ impl Default for BlockDeviceInfo {
     fn default() -> Self {
         Self {
             block_device_driver: String::new(),
+            erofs_rootfs_driver: String::new(),
             block_device_aio: String::new(),
             block_device_cache_set: false,
             block_device_cache_direct: false,
@@ -432,6 +448,18 @@ impl BlockDeviceInfo {
                 self.block_device_driver,
             )));
         }
+
+        // The EROFS rootfs override only exists to opt the read-only container
+        // image layers into virtio-pmem. Anything else is a configuration
+        // mistake, since those layers would just keep using
+        // `block_device_driver`.
+        if !self.erofs_rootfs_driver.is_empty() && self.erofs_rootfs_driver != VIRTIO_PMEM {
+            return Err(std::io::Error::other(format!(
+                "{} is an unsupported EROFS rootfs block device type, only {} is supported.",
+                self.erofs_rootfs_driver, VIRTIO_PMEM,
+            )));
+        }
+
         validate_path!(
             self.vhost_user_store_path,
             "Invalid vhost-user-store-path {}: {}"
@@ -1951,6 +1979,18 @@ impl ConfigOps for Hypervisor {
                 let hv = conf.hypervisor.get(hypervisor).unwrap();
                 hv.blockdev_info.validate()?;
                 hv.boot_info.validate()?;
+
+                // virtio-pmem backed EROFS layers are hot-plugged through a
+                // hypervisor-specific API. Only the Cloud Hypervisor driver
+                // implements it today.
+                if hypervisor.as_str() != HYPERVISOR_NAME_CH
+                    && hv.blockdev_info.erofs_rootfs_driver == VIRTIO_PMEM
+                {
+                    return Err(std::io::Error::other(format!(
+                        "erofs_rootfs_driver={} is only supported by the {} hypervisor",
+                        VIRTIO_PMEM, HYPERVISOR_NAME_CH,
+                    )));
+                }
                 for extra in &hv.guest_extension_images {
                     validate_path!(extra.path, "extra image file {} is invalid: {}")?;
                     if extra.name.is_empty() {
@@ -2384,5 +2424,25 @@ mod tests {
             blockdev_info_with_sectors(65536, 512).validate().is_err(),
             "logical > physical should be rejected"
         );
+    }
+
+    #[test]
+    fn test_validate_erofs_rootfs_driver() {
+        let mut blockdev = blockdev_info_with_sectors(0, 0);
+
+        // The default keeps using block_device_driver for the EROFS layers.
+        assert!(blockdev.validate().is_ok());
+
+        blockdev.erofs_rootfs_driver = VIRTIO_PMEM.to_string();
+        assert!(blockdev.validate().is_ok());
+
+        for driver in ["virtio-blk-pci", "virtio-scsi", "nvdimm"] {
+            blockdev.erofs_rootfs_driver = driver.to_string();
+            assert!(
+                blockdev.validate().is_err(),
+                "expected erofs_rootfs_driver={} to be rejected",
+                driver
+            );
+        }
     }
 }

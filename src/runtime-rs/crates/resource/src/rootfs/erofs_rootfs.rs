@@ -28,6 +28,7 @@ use hypervisor::{
     virtio_blk_modern::BlockSourceFormat,
     BlockConfigModern, BlockDeviceAio,
 };
+use kata_types::config::hypervisor::{BlockDeviceInfo, VIRTIO_PMEM};
 use kata_types::mount::Mount;
 use kata_types::{
     gpt_disk::{
@@ -62,6 +63,34 @@ pub(crate) const DEFAULT_KATA_GUEST_ROOT_SHARED_FS: &str = "/run/kata-containers
 const X_CONTAINERD_MKDIR_PATH: &str = "X-containerd.mkdir.path=";
 /// Template for mkdir option passed to guest agent (X-kata.mkdir.path)
 const X_KATA_MKDIR_PATH: &str = "X-kata.mkdir.path=";
+
+/// Pick the block device driver for a read-only EROFS layer device.
+///
+/// `erofs_rootfs_driver` lets the container image rootfs use a driver that
+/// differs from `block_device_driver`, which also backs writable volumes and
+/// the ext4 upper layer. virtio-pmem maps the backing file directly into guest
+/// memory, so it only works for raw EROFS images: layouts merged into a VMDK
+/// descriptor cannot be attached that way and fall back to
+/// `block_device_driver`.
+fn erofs_block_driver(blkdev_info: &BlockDeviceInfo, is_raw: bool) -> String {
+    let erofs_driver = blkdev_info.erofs_rootfs_driver.as_str();
+    if erofs_driver != VIRTIO_PMEM {
+        return blkdev_info.block_device_driver.clone();
+    }
+
+    if is_raw {
+        return erofs_driver.to_string();
+    }
+
+    warn!(
+        sl!(),
+        "erofs_rootfs_driver={} requires a raw EROFS image, but the layers are merged \
+         into a VMDK; falling back to block_device_driver={}",
+        erofs_driver,
+        blkdev_info.block_device_driver
+    );
+    blkdev_info.block_device_driver.clone()
+}
 
 /// Create the per-container directory under the shared filesystem root.
 pub(crate) fn ensure_container_dir(sid: &str, cid: &str) -> Result<PathBuf> {
@@ -632,8 +661,12 @@ impl ErofsMultiLayerRootfs {
                             layout.partitions.len()
                         );
 
+                        // GPT layouts are always VMDK-backed, so an EROFS driver
+                        // that needs a raw image (virtio-pmem) falls back to
+                        // block_device_driver.
+                        let erofs_driver = erofs_block_driver(&blkdev_info, false);
                         let device_config = &mut BlockConfigModern {
-                            driver_option: block_driver.clone(),
+                            driver_option: erofs_driver,
                             source: BlockSourceFormat::Vmdk(vmdk),
                             path_on_host: erofs_path,
                             is_readonly: true,
@@ -783,8 +816,12 @@ impl ErofsMultiLayerRootfs {
                             cleanup_paths.push(PathBuf::from(&erofs_path));
                         }
 
+                        // A single merged EROFS file stays raw and can be
+                        // attached as virtio-pmem; a multi-device merge is a
+                        // VMDK and keeps using block_device_driver.
+                        let erofs_driver = erofs_block_driver(&blkdev_info, !is_vmdk);
                         let device_config = &mut BlockConfigModern {
-                            driver_option: block_driver.clone(),
+                            driver_option: erofs_driver,
                             source,
                             path_on_host: erofs_path,
                             is_readonly: true, // EROFS layers are read-only, must set to avoid "resize" lock errors
@@ -986,9 +1023,42 @@ pub fn is_erofs_multi_layer(rootfs_mounts: &[Mount]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_erofs_multi_layer, EROFS_ROOTFS_TYPE, RW_LAYER_ROOTFS_TYPE};
+    use super::{
+        erofs_block_driver, is_erofs_multi_layer, EROFS_ROOTFS_TYPE, RW_LAYER_ROOTFS_TYPE,
+    };
+    use kata_types::config::hypervisor::{BlockDeviceInfo, VIRTIO_BLK_PCI, VIRTIO_PMEM};
     use kata_types::mount::Mount;
     use std::path::PathBuf;
+
+    fn blkdev_info(erofs_driver: &str) -> BlockDeviceInfo {
+        BlockDeviceInfo {
+            block_device_driver: VIRTIO_BLK_PCI.to_string(),
+            erofs_rootfs_driver: erofs_driver.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn erofs_block_driver_defaults_to_block_device_driver() {
+        assert_eq!(erofs_block_driver(&blkdev_info(""), true), VIRTIO_BLK_PCI);
+        assert_eq!(erofs_block_driver(&blkdev_info(""), false), VIRTIO_BLK_PCI);
+    }
+
+    #[test]
+    fn erofs_block_driver_uses_pmem_for_raw_images() {
+        assert_eq!(
+            erofs_block_driver(&blkdev_info(VIRTIO_PMEM), true),
+            VIRTIO_PMEM
+        );
+    }
+
+    #[test]
+    fn erofs_block_driver_falls_back_for_vmdk_images() {
+        assert_eq!(
+            erofs_block_driver(&blkdev_info(VIRTIO_PMEM), false),
+            VIRTIO_BLK_PCI
+        );
+    }
 
     fn mount(fs_type: &str, options: &[&str]) -> Mount {
         Mount {

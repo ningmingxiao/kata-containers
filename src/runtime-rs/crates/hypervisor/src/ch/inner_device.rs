@@ -18,17 +18,18 @@ use crate::ProtectionDeviceConfig;
 use crate::ShareFsConfig;
 use crate::ShareFsDevice;
 use crate::VmmState;
-use crate::{BlockConfigModern, BlockDeviceModern};
+use crate::{BlockConfigModern, BlockDeviceModern, KATA_NVDIMM_DEV_TYPE};
 use anyhow::{anyhow, ensure, Context, Result};
 use ch_config::ch_api::cloud_hypervisor_vm_device_add;
 use ch_config::ch_api::{
     cloud_hypervisor_vm_blockdev_add, cloud_hypervisor_vm_device_remove,
     cloud_hypervisor_vm_fs_add, cloud_hypervisor_vm_netdev_add_with_fds,
-    cloud_hypervisor_vm_vsock_add, PciDeviceInfo, VmRemoveDeviceData,
+    cloud_hypervisor_vm_pmem_add, cloud_hypervisor_vm_vsock_add, PciDeviceInfo, VmRemoveDeviceData,
 };
 use ch_config::convert::{DEFAULT_DISK_QUEUES, DEFAULT_DISK_QUEUE_SIZE, DEFAULT_NUM_PCI_SEGMENTS};
 use ch_config::DiskConfig;
 use ch_config::ImageType;
+use ch_config::PmemConfig;
 use ch_config::{
     net_util::MacAddr, DeviceConfig, FsConfig, NetConfig, ProtectionDevConfig, VsockConfig,
 };
@@ -50,6 +51,37 @@ use tokio::sync::Mutex;
 use virtio_bindings::bindings::virtio_blk::VIRTIO_BLK_ID_BYTES;
 
 const VIRTIO_FS: &str = "virtio-fs";
+
+/// Alignment cloud-hypervisor requires for a virtio-pmem region.
+///
+/// The backing file is mapped into guest memory, so the region has to be
+/// 2 MiB aligned for the mapping to be hugepage backed. cloud-hypervisor
+/// derives the region size from the file length when the request does not
+/// carry one, which makes it reject any image whose length is not a multiple
+/// of 2 MiB.
+const CH_PMEM_REGION_ALIGNMENT: u64 = 2 * 1024 * 1024;
+
+/// Region size to request for a virtio-pmem backing file.
+///
+/// EROFS layers are ordinary image files whose length is not aligned to
+/// anything in particular, so the region is rounded up to the alignment
+/// cloud-hypervisor insists on. Rounding up is safe: EROFS takes its own size
+/// from the on-disk superblock and never reads the trailing padding, and the
+/// mapping is created with `MAP_NORESERVE` so the padding costs nothing until
+/// it is touched.
+fn pmem_region_size(file: &Path) -> Result<u64> {
+    let len = std::fs::metadata(file)
+        .with_context(|| format!("stat virtio-pmem backing file {}", file.display()))?
+        .len();
+
+    ensure!(
+        len > 0,
+        "virtio-pmem backing file {} is empty",
+        file.display()
+    );
+
+    Ok(len.div_ceil(CH_PMEM_REGION_ALIGNMENT) * CH_PMEM_REGION_ALIGNMENT)
+}
 
 impl CloudHypervisorInner {
     pub(crate) async fn add_device(&mut self, device: DeviceType) -> Result<DeviceType> {
@@ -336,6 +368,13 @@ impl CloudHypervisorInner {
             (dev.device_id.clone(), dev.config.clone())
         };
 
+        // virtio-pmem devices use a dedicated API and are only meaningful for
+        // read-only media. The read-only EROFS image layers are the only block
+        // devices Kata attaches this way.
+        if config.driver_option == KATA_NVDIMM_DEV_TYPE {
+            return self.handle_pmem_device(device, device_id, config).await;
+        }
+
         let disk_config = self.make_disk_config(&config)?;
 
         let response = cloud_hypervisor_vm_blockdev_add(&self.api_socket, disk_config).await?;
@@ -349,6 +388,52 @@ impl CloudHypervisorInner {
 
             // Persist the cloud-hypervisor assigned PCI path back into the device
             // so it can be used later for removal / hot-unplug.
+            let mut block_dev = device.lock().await;
+            block_dev.config.pci_path = Some(Self::clh_pci_info_to_path(dev_info.bdf.as_str())?);
+        }
+
+        Ok(DeviceType::BlockModern(device))
+    }
+
+    async fn handle_pmem_device(
+        &mut self,
+        device: Arc<Mutex<BlockDeviceModern>>,
+        device_id: String,
+        config: BlockConfigModern,
+    ) -> Result<DeviceType> {
+        // A pmem device is backed by a host file mapped into guest memory, so
+        // the guest could write straight through to the host page cache. Only
+        // read-only media may be attached this way.
+        if !config.is_readonly {
+            return Err(anyhow!(
+                "virtio-pmem block device {} must be read-only",
+                config.path_on_host
+            ));
+        }
+
+        let file = PathBuf::from(&config.path_on_host);
+
+        // `discard_writes` makes cloud-hypervisor open the backing file
+        // read-only and discard any write the guest issues, which matches the
+        // read-only EROFS layers. The explicit `size` keeps the region 2 MiB
+        // aligned, which cloud-hypervisor requires and which it cannot derive
+        // from an EROFS layer file.
+        let pmem_config = PmemConfig {
+            size: Some(pmem_region_size(&file)?),
+            file,
+            discard_writes: true,
+            ..Default::default()
+        };
+
+        let response = cloud_hypervisor_vm_pmem_add(&self.api_socket, pmem_config).await?;
+
+        if let Some(detail) = response {
+            debug!(sl!(), "pmem add response: {:?}", detail);
+
+            let dev_info: PciDeviceInfo =
+                serde_json::from_str(detail.as_str()).map_err(|e| anyhow!(e))?;
+            self.device_ids.insert(device_id, dev_info.id);
+
             let mut block_dev = device.lock().await;
             block_dev.config.pci_path = Some(Self::clh_pci_info_to_path(dev_info.bdf.as_str())?);
         }
@@ -819,5 +904,43 @@ mod tests {
                 assert!(error.to_string().contains("must be normalized"));
             }
         }
+    }
+
+    #[rstest]
+    #[case(1, 2 * 1024 * 1024)]
+    #[case(749_568, 2 * 1024 * 1024)]
+    #[case(2 * 1024 * 1024, 2 * 1024 * 1024)]
+    #[case(2 * 1024 * 1024 + 1, 4 * 1024 * 1024)]
+    fn test_pmem_region_size_rounds_up_to_alignment(#[case] file_len: u64, #[case] expected: u64) {
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("layer.erofs");
+        std::fs::File::create(&image)
+            .unwrap()
+            .set_len(file_len)
+            .unwrap();
+
+        assert_eq!(pmem_region_size(&image).unwrap(), expected);
+        assert_eq!(expected % CH_PMEM_REGION_ALIGNMENT, 0);
+    }
+
+    #[test]
+    fn test_pmem_region_size_rejects_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("empty.erofs");
+        std::fs::File::create(&image).unwrap();
+
+        let error = pmem_region_size(&image).unwrap_err();
+        assert!(error.to_string().contains("is empty"), "{}", error);
+    }
+
+    #[test]
+    fn test_pmem_region_size_rejects_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = pmem_region_size(&dir.path().join("absent.erofs")).unwrap_err();
+        assert!(
+            error.to_string().contains("stat virtio-pmem backing file"),
+            "{}",
+            error
+        );
     }
 }

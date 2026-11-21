@@ -126,6 +126,13 @@ cfg_if! {
 // sysfs as directories in the subtree under /sys/devices/LNXSYSTM:00
 pub const ACPI_DEV_PATH: &str = "/devices/LNXSYSTM";
 
+// Devices attached to a PCI bus are exported to user space under the PCI root
+// bus, e.g. /sys/devices/pci0000:00/0000:00:05.0. virtio-pmem devices, such as
+// the ones Cloud Hypervisor hot-plugs, are PCI devices, so their NVDIMM bus and
+// the pmem block devices below it live under this subtree rather than under the
+// ACPI namespace used by NFIT described NVDIMMs.
+pub const PCI_DEV_PATH: &str = "/devices/pci";
+
 pub const SYSFS_CPU_PATH: &str = "/sys/devices/system/cpu";
 pub const SYSFS_CPU_ONLINE_PATH: &str = "/sys/devices/system/cpu/online";
 

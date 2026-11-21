@@ -5,7 +5,7 @@
 //
 
 use crate::device::{DeviceContext, DeviceHandler, DeviceInfo, SpecUpdate, BLOCK};
-use crate::linux_abi::ACPI_DEV_PATH;
+use crate::linux_abi::{ACPI_DEV_PATH, PCI_DEV_PATH};
 use crate::sandbox::Sandbox;
 use crate::uevent::{wait_for_uevent, Uevent, UeventMatcher};
 use anyhow::{anyhow, Context, Result};
@@ -76,10 +76,21 @@ impl PmemBlockMatcher {
 impl UeventMatcher for PmemBlockMatcher {
     fn is_match(&self, uev: &Uevent) -> bool {
         uev.subsystem == BLOCK
-            && uev.devpath.starts_with(ACPI_DEV_PATH)
+            && is_pmem_devpath(&uev.devpath)
             && uev.devpath.ends_with(&self.suffix)
             && !uev.devname.is_empty()
     }
+}
+
+/// Check whether a sysfs devpath belongs to a pmem block device.
+///
+/// A pmem device can be described either by an ACPI NFIT NVDIMM, as QEMU does
+/// with `-device nvdimm`, or by a virtio-pmem device. The latter is a PCI
+/// device (Cloud Hypervisor and QEMU both expose it that way), so the NVDIMM bus
+/// and the block device below it hang off the PCI root bus instead of the ACPI
+/// namespace.
+fn is_pmem_devpath(devpath: &str) -> bool {
+    devpath.starts_with(ACPI_DEV_PATH) || devpath.starts_with(PCI_DEV_PATH)
 }
 
 #[cfg(test)]
@@ -97,6 +108,21 @@ mod tests {
         uev.devpath = format!(
             "{}/LNXSYSTM:00/LNXSYBUS:00/ACPI0012:00/ndbus0/region{}/btt{}.0/block/{}",
             ACPI_DEV_PATH, region, region, devname
+        );
+        uev
+    }
+
+    // Helper to create a PMEM uevent for a virtio-pmem device. Unlike an ACPI
+    // NFIT NVDIMM, virtio-pmem is a PCI device, so its NVDIMM bus and block
+    // device hang off the PCI root bus.
+    fn create_virtio_pmem_uevent(devname: &str) -> crate::uevent::Uevent {
+        let mut uev = crate::uevent::Uevent::default();
+        uev.action = crate::linux_abi::U_EVENT_ACTION_ADD.to_string();
+        uev.subsystem = BLOCK.to_string();
+        uev.devname = devname.to_string();
+        uev.devpath = format!(
+            "{}0000:00/0000:00:05.0/virtio1/ndbus0/region0/block/{}",
+            PCI_DEV_PATH, devname
         );
         uev
     }
@@ -155,16 +181,38 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case::virtio_pmem0_matches_pmem0("pmem0", "pmem0", true)]
+    #[case::virtio_pmem0_rejects_pmem1("pmem0", "pmem1", false)]
+    #[tokio::test]
+    async fn test_pmem_block_matcher_virtio_pmem_devpath(
+        #[case] matcher_devname: &str,
+        #[case] uevent_devname: &str,
+        #[case] should_match: bool,
+    ) {
+        let matcher = PmemBlockMatcher::new(matcher_devname);
+        let uev = create_virtio_pmem_uevent(uevent_devname);
+
+        assert_eq!(
+            matcher.is_match(&uev),
+            should_match,
+            "Matcher for '{}' should {} virtio-pmem uevent for '{}'",
+            matcher_devname,
+            if should_match { "match" } else { "reject" },
+            uevent_devname
+        );
+    }
+
     #[tokio::test]
     async fn test_pmem_block_matcher_wrong_prefix() {
         let devname = "pmem0";
         let matcher = PmemBlockMatcher::new(devname);
         let mut uev = create_pmem_uevent(devname, 0);
-        uev.devpath = format!("/devices/pci0000:00/block/{}", devname);
+        uev.devpath = format!("/devices/platform/ndbus0/block/{}", devname);
 
         assert!(
             !matcher.is_match(&uev),
-            "Matcher should reject devpath not starting with ACPI_DEV_PATH"
+            "Matcher should reject devpath outside the ACPI and PCI subtrees"
         );
     }
 

@@ -116,6 +116,10 @@ pub const SHA512: &str = "sha512";
 /// Specify the driver to be used for block device either VirtioSCSI or VirtioBlock
 pub const KATA_ANNO_CFG_HYPERVISOR_BLOCK_DEV_DRIVER: &str =
     "io.katacontainers.config.hypervisor.block_device_driver";
+/// Specify the driver used for the read-only EROFS layers of a container image
+/// root filesystem. Only `virtio-pmem` is supported.
+pub const KATA_ANNO_CFG_HYPERVISOR_EROFS_ROOTFS_DRIVER: &str =
+    "io.katacontainers.config.hypervisor.erofs_rootfs_driver";
 /// A sandbox annotation that specifies cache-related options will be set to block devices or not.
 pub const KATA_ANNO_CFG_HYPERVISOR_BLOCK_DEV_CACHE_SET: &str =
     "io.katacontainers.config.hypervisor.block_device_cache_set";
@@ -599,6 +603,9 @@ impl Annotation {
                     // Hypervisor Block Device related annotations
                     KATA_ANNO_CFG_HYPERVISOR_BLOCK_DEV_DRIVER => {
                         hv.blockdev_info.block_device_driver = value.to_string();
+                    }
+                    KATA_ANNO_CFG_HYPERVISOR_EROFS_ROOTFS_DRIVER => {
+                        hv.blockdev_info.erofs_rootfs_driver = value.to_string();
                     }
                     KATA_ANNO_CFG_HYPERVISOR_BLOCK_DEV_CACHE_SET => {
                         match self.get_value::<bool>(key) {

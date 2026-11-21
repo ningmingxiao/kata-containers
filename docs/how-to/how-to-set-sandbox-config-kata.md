@@ -60,6 +60,7 @@ Warning: do not enable `virtio_fs_extra_args` in `enable_annotations` unless you
 | `io.katacontainers.config.hypervisor.block_device_cache_noflush` | `boolean` | Denotes whether flush requests for the device are ignored |
 | `io.katacontainers.config.hypervisor.block_device_cache_set` | `boolean` | cache-related options will be set to block devices or not |
 | `io.katacontainers.config.hypervisor.block_device_driver` | string | the driver to be used for block device, valid values are `virtio-blk`, `virtio-scsi`, `nvdimm`|
+| `io.katacontainers.config.hypervisor.erofs_rootfs_driver` | string | the driver to be used for the read-only EROFS layers of a container image rootfs; only `virtio-pmem` is supported, and only by the Cloud Hypervisor driver |
 | `io.katacontainers.config.hypervisor.blk_logical_sector_size` | uint32 | logical sector size in bytes reported by block devices to the guest (0 = hypervisor default, must be a power of 2 between 512 and 65536) |
 | `io.katacontainers.config.hypervisor.blk_physical_sector_size` | uint32 | physical sector size in bytes reported by block devices to the guest (0 = hypervisor default, must be a power of 2 between 512 and 65536) |
 | `io.katacontainers.config.hypervisor.cpu_features` | `string` | Comma-separated list of CPU features to pass to the CPU (QEMU) |
